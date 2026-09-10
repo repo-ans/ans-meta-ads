@@ -1,0 +1,447 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "b1c2d3e4-0001-4a00-8000-000000000001",
+      "name": "Daily Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [8320, 1600],
+      "notes": "Runs every day at 7 AM, pulling yesterday's metrics (date_preset=yesterday on every Meta Insights call below)."
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "meta-ads-report-execute",
+        "options": {}
+      },
+      "id": "b1c2d3e4-0002-4a00-8000-000000000002",
+      "name": "Execute Now Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [8320, 1760],
+      "webhookId": "meta-ads-report-execute-webhook-id",
+      "notes": "Manual trigger for testing/on-demand runs (e.g. right after onboarding a new client, to hit the < 15 min first-report target without waiting for the next 7 AM run)."
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Clients",
+          "mode": "list"
+        },
+        "options": {}
+      },
+      "id": "b1c2d3e4-0003-4a00-8000-000000000003",
+      "name": "Read Client List",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [8544, 1680],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_WITH_YOUR_GOOGLE_SHEETS_CREDENTIAL"
+        }
+      },
+      "notes": "Reads the shared 'Clients' config tab — one row per client (internal Aniya accounts count as a 'client' row too, for the dual-use internal+client case). Expected columns: client_name | ad_account_id | sheet_tab | slack_channel_url | spend_spike_pct | cpl_double_threshold | active. See README for exact column meanings and defaults."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Only process rows explicitly marked active, and normalise field names/\n// defaults so a client row with blank threshold columns still works.\nconst rows = $input.all().map(item => item.json);\n\nreturn rows\n  .filter(r => String(r.active || '').trim().toLowerCase() !== 'no' && String(r.active || '').trim().toLowerCase() !== 'false')\n  .map(r => ({\n    json: {\n      client_name: String(r.client_name || '').trim(),\n      ad_account_id: String(r.ad_account_id || '').trim(), // expects the 'act_XXXXXXXXXX' format\n      sheet_tab: String(r.sheet_tab || r.client_name || '').trim(),\n      slack_channel_url: String(r.slack_channel_url || '').trim(),\n      // Defaults if a client row leaves these blank — see README for how\n      // these are actually used in the alert-check step further down.\n      spend_spike_pct: parseFloat(r.spend_spike_pct) || 50,\n      cpl_double_threshold: parseFloat(r.cpl_double_threshold) || 2.0\n    }\n  }));"
+      },
+      "id": "b1c2d3e4-0004-4a00-8000-000000000004",
+      "name": "Filter Active Clients",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [8768, 1680],
+      "notes": "Drops any client row marked inactive, applies default alert thresholds where a client hasn't set their own."
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "b1c2d3e4-0005-4a00-8000-000000000005",
+      "name": "Loop Over Clients",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [8992, 1680],
+      "notes": "Processes one client at a time end-to-end (fetch -> log -> alert-check -> report -> deliver) before moving to the next, so one client's Meta API error doesn't block the rest — each iteration is independent."
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v21.0/{{ $json.ad_account_id }}/insights",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "level", "value": "campaign" },
+            { "name": "date_preset", "value": "yesterday" },
+            {
+              "name": "fields",
+              "value": "campaign_id,campaign_name,spend,impressions,clicks,cpm,cpc,ctr,frequency,actions,cost_per_action_type,purchase_roas"
+            },
+            { "name": "access_token", "value": "REPLACE_WITH_YOUR_SYSTEM_USER_TOKEN" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "id": "b1c2d3e4-0006-4a00-8000-000000000006",
+      "name": "Fetch Campaign Insights",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [9216, 1520],
+      "notes": "Meta Marketing API version pinned to v21.0 as a starting point — check developers.facebook.com/docs/graph-api/changelog for the current version before going live, Meta deprecates old versions on a schedule. Move access_token into an n8n HTTP Query Auth or Header Auth credential instead of leaving it inline — this file has no secrets in it yet, keep it that way."
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v21.0/{{ $('Loop Over Clients').item.json.ad_account_id }}/insights",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "level", "value": "adset" },
+            { "name": "date_preset", "value": "yesterday" },
+            {
+              "name": "fields",
+              "value": "campaign_id,adset_id,adset_name,spend,impressions,clicks,cpm,cpc,ctr,frequency,actions,cost_per_action_type,purchase_roas"
+            },
+            { "name": "access_token", "value": "REPLACE_WITH_YOUR_SYSTEM_USER_TOKEN" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "id": "b1c2d3e4-0007-4a00-8000-000000000007",
+      "name": "Fetch AdSet Insights",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [9216, 1680],
+      "notes": "Same Insights endpoint, level=adset. Runs off 'Loop Over Clients' directly (parallel to the campaign-level call) rather than chaining off it, since these three fetches don't depend on each other."
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v21.0/{{ $('Loop Over Clients').item.json.ad_account_id }}/insights",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "level", "value": "ad" },
+            { "name": "date_preset", "value": "yesterday" },
+            {
+              "name": "fields",
+              "value": "campaign_id,adset_id,ad_id,ad_name,spend,impressions,clicks,cpm,cpc,ctr,frequency,actions,cost_per_action_type,purchase_roas"
+            },
+            { "name": "access_token", "value": "REPLACE_WITH_YOUR_SYSTEM_USER_TOKEN" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "id": "b1c2d3e4-0008-4a00-8000-000000000008",
+      "name": "Fetch Ad Insights",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [9216, 1840],
+      "notes": "Same Insights endpoint, level=ad."
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v21.0/{{ $('Loop Over Clients').item.json.ad_account_id }}/ads",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "fields", "value": "id,name,effective_status,campaign_id,adset_id" },
+            { "name": "access_token", "value": "REPLACE_WITH_YOUR_SYSTEM_USER_TOKEN" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "responseFormat": "json" } }
+        }
+      },
+      "id": "b1c2d3e4-0009-4a00-8000-000000000009",
+      "name": "Fetch Ad Statuses",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [9216, 2000],
+      "notes": "Separate call, NOT the Insights endpoint — effective_status (which flags DISAPPROVED / rejected ads) isn't a metric Insights returns, it lives on the /ads edge itself. This is how the 'ad rejection' alert gets its data."
+    },
+    {
+      "parameters": {
+        "numberInputs": 4
+      },
+      "id": "b1c2d3e4-0012-4a00-8000-000000000012",
+      "name": "Wait For All Fetches",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [-96, -304],
+      "notes": "Synchronization barrier — do not remove. Normalise Metrics reads all 4 fetch nodes by name via $('NodeName'), but originally had 4 separate direct connections into it; n8n fires a node as soon as ANY one of several incoming connections delivers data, not once all of them have, so it was running before the slower branches finished and throwing '<Node> hasn't been executed'. This Merge node (4 inputs, default mode) waits for every branch to complete before passing anything through — its own merged output isn't actually used downstream, it exists purely to force the wait."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge campaign/adset/ad insights + ad statuses into one flat, normalised\n// row-per-entity list for this client, ready to append to their sheet tab.\nconst client = $('Loop Over Clients').item.json;\nconst campaignResp = $('Fetch Campaign Insights').first().json;\nconst adsetResp = $('Fetch AdSet Insights').first().json;\nconst adResp = $('Fetch Ad Insights').first().json;\nconst statusResp = $('Fetch Ad Statuses').first().json;\n\nconst today = new Date().toISOString().slice(0, 10);\n\n// Meta returns costs/results nested inside `actions` / `cost_per_action_type`\n// arrays keyed by action_type, not flat fields — pull out a lead-ish action.\n// Ad accounts vary in which action_type represents \"a lead\" for them\n// (lead form vs offsite pixel vs on-Facebook conversion) — this checks the\n// common ones in order and falls back gracefully if none match.\nconst LEAD_ACTION_TYPES = ['lead', 'onsite_conversion.lead_grouped', 'offsite_conversion.fb_pixel_lead'];\n\nfunction findAction(actions, types) {\n  if (!Array.isArray(actions)) return null;\n  for (const t of types) {\n    const match = actions.find(a => a.action_type === t);\n    if (match) return match;\n  }\n  return null;\n}\n\nfunction rowFromInsight(insight, level) {\n  const resultAction = findAction(insight.actions, LEAD_ACTION_TYPES);\n  const results = resultAction ? Number(resultAction.value) : 0;\n  const spend = Number(insight.spend) || 0;\n  const costPerResult = results > 0 ? spend / results : null;\n\n  const roasEntry = Array.isArray(insight.purchase_roas) ? insight.purchase_roas[0] : null;\n  const roas = roasEntry ? Number(roasEntry.value) : null;\n\n  return {\n    date: today,\n    client_name: client.client_name,\n    level,\n    entity_id: (level === 'campaign' ? insight.campaign_id : level === 'adset' ? insight.adset_id : insight.ad_id) || '',\n    entity_name: (level === 'campaign' ? insight.campaign_name : level === 'adset' ? insight.adset_name : insight.ad_name) || '',\n    campaign_id: insight.campaign_id || '',\n    adset_id: insight.adset_id || '',\n    ad_id: insight.ad_id || '',\n    spend,\n    impressions: Number(insight.impressions) || 0,\n    clicks: Number(insight.clicks) || 0,\n    cpm: Number(insight.cpm) || 0,\n    cpc: Number(insight.cpc) || 0,\n    ctr: Number(insight.ctr) || 0,\n    frequency: Number(insight.frequency) || 0,\n    results,\n    cost_per_result: costPerResult,\n    roas,\n    effective_status: ''\n  };\n}\n\nconst campaignRows = (campaignResp.data || []).map(i => rowFromInsight(i, 'campaign'));\nconst adsetRows = (adsetResp.data || []).map(i => rowFromInsight(i, 'adset'));\nconst adRows = (adResp.data || []).map(i => rowFromInsight(i, 'ad'));\n\n// Attach effective_status onto the matching ad-level rows so the alert-check\n// step downstream can flag any DISAPPROVED / rejected ad.\nconst statusById = new Map((statusResp.data || []).map(a => [a.id, a.effective_status]));\nfor (const row of adRows) {\n  row.effective_status = statusById.get(row.ad_id) || '';\n}\n\nconst allRows = [...campaignRows, ...adsetRows, ...adRows];\n\n// n8n stops a branch dead when a node outputs zero items, which would\n// silently skip logging/reporting/alerting entirely on a day with no\n// campaign activity. Emit one explicit marker row instead so the rest of\n// the chain always runs, and the sheet has an honest record of \"nothing\n// happened\" rather than a gap.\nif (allRows.length === 0) {\n  return [{\n    json: {\n      date: today,\n      client_name: client.client_name,\n      level: 'none',\n      entity_id: '',\n      entity_name: 'No data returned from Meta for this period',\n      campaign_id: '',\n      adset_id: '',\n      ad_id: '',\n      spend: 0,\n      impressions: 0,\n      clicks: 0,\n      cpm: 0,\n      cpc: 0,\n      ctr: 0,\n      frequency: 0,\n      results: 0,\n      cost_per_result: null,\n      roas: null,\n      effective_status: '',\n      ...client\n    }\n  }];\n}\n\nreturn allRows.map(row => ({ json: { ...row, ...client } }));"
+      },
+      "id": "b1c2d3e4-000a-4a00-8000-00000000000a",
+      "name": "Normalise Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [9440, 1680],
+      "notes": "Flattens the three Insights responses + the ad-status response into one row-per-entity list, computing cost_per_result (CPL) and pulling ROAS out of Meta's nested actions/purchase_roas arrays. Outputs one n8n item per row -- downstream nodes operate on all of them at once for this client."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "={{ $('Loop Over Clients').item.json.sheet_tab }}",
+          "mode": "id"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData"
+        },
+        "options": {}
+      },
+      "id": "b1c2d3e4-000b-4a00-8000-00000000000b",
+      "name": "Log to Client Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [9664, 1680],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_WITH_YOUR_GOOGLE_SHEETS_CREDENTIAL"
+        }
+      },
+      "notes": "Appends every row for this client to their own tab (tab name comes from the Clients config row -- must already exist with a matching header row, see README). This is the historical log the WoW comparison below reads back from."
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "={{ $('Loop Over Clients').item.json.sheet_tab }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "b1c2d3e4-000c-4a00-8000-00000000000c",
+      "name": "Read Sheet History",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [9888, 1680],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_WITH_YOUR_GOOGLE_SHEETS_CREDENTIAL"
+        }
+      },
+      "notes": "Reads the client's ENTIRE tab back (including the rows just appended) so the next step can find last week's matching rows for the WoW comparison. Fine at the row counts a single client's daily campaign/adset/ad breakdown produces; if a sheet grows very large over many months, switch this to a filtered/date-ranged read instead of a full-tab read."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compute week-over-week deltas per entity_id, and flag alert-worthy\n// conditions: spend spikes, CPL doubling, and any rejected ad.\nconst allRows = $input.all().map(item => item.json);\nconst client = $('Loop Over Clients').item.json;\n\nconst today = new Date().toISOString().slice(0, 10);\nconst todayRows = allRows.filter(r => r.date === today);\n\nconst sevenDaysAgo = new Date();\nsevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);\nconst weekAgoDate = sevenDaysAgo.toISOString().slice(0, 10);\n\nconst enriched = todayRows.map(row => {\n  const prior = allRows.find(r => r.date === weekAgoDate && r.entity_id === row.entity_id && r.level === row.level);\n  const priorSpend = prior ? Number(prior.spend) : null;\n  const priorCpl = prior && prior.cost_per_result ? Number(prior.cost_per_result) : null;\n\n  const spendChangePct = priorSpend && priorSpend > 0\n    ? ((row.spend - priorSpend) / priorSpend) * 100\n    : null;\n  const cplRatio = priorCpl && row.cost_per_result\n    ? row.cost_per_result / priorCpl\n    : null;\n\n  return {\n    ...row,\n    prior_spend: priorSpend,\n    spend_change_pct: spendChangePct,\n    prior_cost_per_result: priorCpl,\n    cpl_ratio_vs_last_week: cplRatio,\n    // Ad fatigue heuristic: frequency climbing while CTR is falling is the\n    // classic \"same people seeing it too often, getting tired of it\" signal.\n    // This is a starting heuristic, not a precise model -- tune thresholds\n    // against real client data once available.\n    fatigue_flag: row.frequency > 3 && row.ctr < 1,\n    spend_spike_flag: spendChangePct !== null && spendChangePct >= client.spend_spike_pct,\n    cpl_doubled_flag: cplRatio !== null && cplRatio >= client.cpl_double_threshold,\n    rejected_flag: String(row.effective_status || '').toUpperCase().includes('DISAPPROV')\n  };\n});\n\nconst anyAlert = enriched.some(r => r.spend_spike_flag || r.cpl_doubled_flag || r.rejected_flag);\n\nreturn [{\n  json: {\n    client_name: client.client_name,\n    slack_channel_url: client.slack_channel_url,\n    rows: enriched,\n    any_alert: anyAlert\n  }\n}];"
+      },
+      "id": "b1c2d3e4-000d-4a00-8000-00000000000d",
+      "name": "Compute WoW Deltas & Alerts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [10112, 1680],
+      "notes": "Matches each of today's rows to the same entity from exactly 7 days ago (by entity_id + level) to compute deltas. Alert thresholds (spend_spike_pct, cpl_double_threshold) come from the client's own Clients-tab row, with defaults applied earlier if left blank. fatigue_flag's frequency>3/ctr<1 heuristic is a rough starting point -- expect to tune it once real data comes in."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "any-alert-check",
+              "leftValue": "={{ $json.any_alert }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b1c2d3e4-000e-4a00-8000-00000000000e",
+      "name": "Any Alert Triggered?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [10336, 1600],
+      "notes": "Splits off an immediate, separate Slack alert from the regular daily report -- alerts shouldn't wait behind the AI narrative generation step, which is slower and less urgent."
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $json.slack_channel_url }}",
+          "mode": "url"
+        },
+        "text": "=:rotating_light: *Alert for {{ $json.client_name }}*\n\n{{ $json.rows.filter(r => r.spend_spike_flag).map(r => `• Spend spike: *${r.entity_name}* up ${r.spend_change_pct.toFixed(0)}% vs last week ($${r.prior_spend.toFixed(2)} → $${r.spend.toFixed(2)})`).join('\\n') }}\n{{ $json.rows.filter(r => r.cpl_doubled_flag).map(r => `• CPL doubled: *${r.entity_name}* $${r.prior_cost_per_result.toFixed(2)} → $${r.cost_per_result.toFixed(2)}`).join('\\n') }}\n{{ $json.rows.filter(r => r.rejected_flag).map(r => `• Ad rejected: *${r.entity_name}*`).join('\\n') }}",
+        "otherOptions": {}
+      },
+      "id": "b1c2d3e4-000f-4a00-8000-00000000000f",
+      "name": "Send Alert to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [10560, 1520],
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_WITH_YOUR_SLACK_CREDENTIAL"
+        }
+      },
+      "notes": "Fires only when Any Alert Triggered? is true. Lists every flagged entity for this client in one message -- verify the inline JS-in-expression syntax renders correctly in your n8n version; if it doesn't, move this formatting into a small Code node upstream instead and pass a plain pre-built string to `text`."
+    },
+    {
+      "parameters": {
+        "modelId": { "__rl": true, "value": "gpt-4o", "mode": "list" },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are a media buyer writing a short, plain-English weekly performance update for a client who is not a marketing expert. Do not use jargon without explaining it in plain terms first.\n\nClient: {{ $json.client_name }}\n\nToday's data (JSON, one row per campaign/ad set/ad, includes week-over-week deltas where available):\n{{ JSON.stringify($json.rows, null, 2) }}\n\nWrite a short report with these sections:\n1. Headline summary (2-3 sentences): overall spend, results, and whether performance is trending better or worse than last week\n2. What's working (bullet points, top 2-3 performers by results/CPL)\n3. What needs attention (bullet points -- anything with spend_spike_flag, cpl_doubled_flag, rejected_flag, or fatigue_flag true; explain each flag in plain English, e.g. \"this ad has been shown to the same people 4+ times and clicks have dropped -- it may need fresh creative\")\n4. One clear recommendation for next week\n\nKeep it under 300 words. No markdown headers, just short paragraph labels in plain text. Do not invent numbers not present in the data."
+            }
+          ]
+        },
+        "options": { "maxTokens": 700, "temperature": 0.4 }
+      },
+      "id": "b1c2d3e4-0010-4a00-8000-000000000010",
+      "name": "Generate Narrative Report",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [10560, 1760],
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_WITH_YOUR_OPENAI_CREDENTIAL"
+        }
+      },
+      "notes": "Runs regardless of whether an alert fired -- this is the regular daily/weekly report, separate from the immediate alert message above. Swap the node type/credential for an Anthropic (Claude) equivalent if that's the preferred model -- the prompt itself doesn't depend on which model runs it."
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $('Compute WoW Deltas & Alerts').item.json.slack_channel_url }}",
+          "mode": "url"
+        },
+        "text": "={{ $json.message.content }}",
+        "otherOptions": {}
+      },
+      "id": "b1c2d3e4-0011-4a00-8000-000000000011",
+      "name": "Deliver Report to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [10784, 1760],
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_WITH_YOUR_SLACK_CREDENTIAL"
+        }
+      },
+      "notes": "v1 delivery channel is Slack only (matches the pattern already used for the blog pipeline's approval flow, and is the fastest to stand up). Email/PDF/GHL delivery from the spec are follow-up additions -- see README."
+    }
+  ],
+  "connections": {
+    "Daily Schedule": {
+      "main": [[{ "node": "Read Client List", "type": "main", "index": 0 }]]
+    },
+    "Execute Now Webhook": {
+      "main": [[{ "node": "Read Client List", "type": "main", "index": 0 }]]
+    },
+    "Read Client List": {
+      "main": [[{ "node": "Filter Active Clients", "type": "main", "index": 0 }]]
+    },
+    "Filter Active Clients": {
+      "main": [[{ "node": "Loop Over Clients", "type": "main", "index": 0 }]]
+    },
+    "Loop Over Clients": {
+      "main": [
+        [],
+        [
+          { "node": "Fetch Campaign Insights", "type": "main", "index": 0 },
+          { "node": "Fetch AdSet Insights", "type": "main", "index": 0 },
+          { "node": "Fetch Ad Insights", "type": "main", "index": 0 },
+          { "node": "Fetch Ad Statuses", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Fetch Campaign Insights": {
+      "main": [[{ "node": "Wait For All Fetches", "type": "main", "index": 0 }]]
+    },
+    "Fetch AdSet Insights": {
+      "main": [[{ "node": "Wait For All Fetches", "type": "main", "index": 1 }]]
+    },
+    "Fetch Ad Insights": {
+      "main": [[{ "node": "Wait For All Fetches", "type": "main", "index": 2 }]]
+    },
+    "Fetch Ad Statuses": {
+      "main": [[{ "node": "Wait For All Fetches", "type": "main", "index": 3 }]]
+    },
+    "Wait For All Fetches": {
+      "main": [[{ "node": "Normalise Metrics", "type": "main", "index": 0 }]]
+    },
+    "Normalise Metrics": {
+      "main": [[{ "node": "Log to Client Sheet", "type": "main", "index": 0 }]]
+    },
+    "Log to Client Sheet": {
+      "main": [[{ "node": "Read Sheet History", "type": "main", "index": 0 }]]
+    },
+    "Read Sheet History": {
+      "main": [[{ "node": "Compute WoW Deltas & Alerts", "type": "main", "index": 0 }]]
+    },
+    "Compute WoW Deltas & Alerts": {
+      "main": [
+        [
+          { "node": "Any Alert Triggered?", "type": "main", "index": 0 },
+          { "node": "Generate Narrative Report", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Any Alert Triggered?": {
+      "main": [[{ "node": "Send Alert to Slack", "type": "main", "index": 0 }], []]
+    },
+    "Generate Narrative Report": {
+      "main": [[{ "node": "Deliver Report to Slack", "type": "main", "index": 0 }]]
+    },
+    "Deliver Report to Slack": {
+      "main": [[{ "node": "Loop Over Clients", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "REPLACE_ME"
+  }
+}
