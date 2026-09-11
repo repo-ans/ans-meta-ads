@@ -1,0 +1,255 @@
+{
+  "name": "Meta - build-campaign",
+  "nodes": [
+    {
+      "parameters": { "httpMethod": "POST", "path": "meta-build-campaign", "options": {} },
+      "id": "f1000000-0000-0000-0000-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-400, 300],
+      "webhookId": "meta-build-campaign",
+      "notes": "Called by IntakeForm.tsx right after inserting a campaign row (status='pending'). Payload: { campaign_id }. Async. Builds a campaign > ad set > (creative > ad) on Meta, ALL PAUSED, then sets status='paused' + pending_review=true so the dashboard flags it for the agency's launch decision."
+    },
+    {
+      "parameters": {
+        "jsCode": "const id = $json.body.campaign_id;\nconst uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;\nif (typeof id !== 'string' || !uuidRe.test(id)) {\n  throw new Error('campaign_id missing or not a valid UUID: ' + JSON.stringify(id));\n}\nreturn [{ json: { campaign_id: id } }];\n"
+      },
+      "id": "f1000000-0000-0000-0000-000000000002",
+      "name": "Validate campaign_id",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-176, 300]
+    },
+    {
+      "parameters": { "operation": "getAll", "tableId": "meta_ads_settings", "limit": 1, "filterType": "none" },
+      "id": "f1000000-0000-0000-0000-000000000003",
+      "name": "Get Meta credentials",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [48, 300],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": { "operation": "get", "tableId": "campaigns", "filters": { "conditions": [ { "keyName": "id", "keyValue": "={{ $('Validate campaign_id').item.json.campaign_id }}" } ] } },
+      "id": "f1000000-0000-0000-0000-000000000004",
+      "name": "Get campaign",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [272, 300],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": { "operation": "get", "tableId": "clients", "filters": { "conditions": [ { "keyName": "id", "keyValue": "={{ $json.client_id }}" } ] } },
+      "id": "f1000000-0000-0000-0000-000000000005",
+      "name": "Get client",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [496, 300],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const row = $('Get campaign').item.json;\nconst client = $json;\nif (!row || !row.id) throw new Error('Campaign row not found.');\nconst token = $('Get Meta credentials').item.json.system_user_token;\nif (!token) throw new Error('meta_ads_settings.system_user_token is not set.');\n\nconst adAccount = (row.meta_ad_account_id || client.meta_ad_account_id || '').trim();\nif (!adAccount || !/^act_\\d+$/.test(adAccount)) {\n  throw new Error('Campaign/client has no valid meta_ad_account_id (expected act_XXXXXXXXXX): ' + JSON.stringify(adAccount));\n}\n\n// objective -> a conservative optimization goal. The campaign launches PAUSED\n// for the agency to review and tune in Ads Manager, so a safe default beats a\n// clever one that might fail validation (e.g. LEAD_GENERATION needs an instant\n// form, OFFSITE_CONVERSIONS needs a pixel + event).\nconst OPT = {\n  OUTCOME_LEADS: 'LINK_CLICKS',\n  OUTCOME_SALES: 'LINK_CLICKS',\n  OUTCOME_TRAFFIC: 'LINK_CLICKS',\n  OUTCOME_AWARENESS: 'REACH',\n  OUTCOME_ENGAGEMENT: 'POST_ENGAGEMENT',\n  OUTCOME_APP_PROMOTION: 'LINK_CLICKS',\n};\nconst objective = row.objective || 'OUTCOME_LEADS';\nconst optimizationGoal = OPT[objective] || 'LINK_CLICKS';\n\nconst countries = Array.isArray(row.targeting_countries) && row.targeting_countries.length\n  ? row.targeting_countries.map(c => String(c).toUpperCase())\n  : ['US'];\nconst targeting = {\n  geo_locations: { countries },\n  age_min: row.targeting_age_min || 18,\n  age_max: row.targeting_age_max || 65,\n};\n\nconst budgetUsd = Number(row.daily_budget_usd || 0);\nif (!(budgetUsd > 0)) throw new Error('daily_budget_usd must be > 0.');\n\nreturn [{ json: {\n  campaignRowId: row.id,\n  adAccount,\n  accessToken: token,\n  apiBase: 'https://graph.facebook.com/v21.0',\n  campaignName: row.campaign_name || 'New campaign',\n  objective,\n  optimizationGoal,\n  bidStrategy: row.bid_strategy || 'LOWEST_COST_WITHOUT_CAP',\n  dailyBudgetMinor: String(Math.round(budgetUsd * 100)),\n  targeting: JSON.stringify(targeting),\n  startTime: new Date(Date.now() + 3600000).toISOString(),\n  pageId: (client.meta_page_id || '').trim() || null,\n  businessName: client.business_name || client.name || 'Our business',\n  websiteUrl: client.website_url || 'https://example.com',\n  primaryGoalText: row.primary_goal || '',\n} }];\n"
+      },
+      "id": "f1000000-0000-0000-0000-000000000006",
+      "name": "Prepare context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 300],
+      "notes": "Throws (halts, visible in n8n's execution log) if the row is missing, has no valid ad account, or has no budget. Unlike the Google version this does NOT auto-write status='error' — reset the row manually if a build half-fails. Consider adding an error handler that writes status='error' + error_message."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "campaigns",
+        "matchType": "allFilters",
+        "filters": { "conditions": [ { "keyName": "id", "condition": "eq", "keyValue": "={{ $json.campaignRowId }}" } ] },
+        "fieldsUi": { "fieldValues": [ { "fieldId": "status", "fieldValue": "building" } ] }
+      },
+      "id": "f1000000-0000-0000-0000-000000000007",
+      "name": "Mark building",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [944, 300],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Prepare context').item.json.apiBase }}/{{ $('Prepare context').item.json.adAccount }}/campaigns",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": { "parameters": [
+          { "name": "name", "value": "={{ $('Prepare context').item.json.campaignName }}" },
+          { "name": "objective", "value": "={{ $('Prepare context').item.json.objective }}" },
+          { "name": "status", "value": "PAUSED" },
+          { "name": "special_ad_categories", "value": "[]" },
+          { "name": "access_token", "value": "={{ $('Prepare context').item.json.accessToken }}" }
+        ] },
+        "options": {}
+      },
+      "id": "f1000000-0000-0000-0000-000000000008",
+      "name": "Create campaign",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1168, 300],
+      "notes": "Response: { id: '<campaign id>' }. special_ad_categories=[] is required by the API for a normal campaign."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Prepare context').item.json.apiBase }}/{{ $('Prepare context').item.json.adAccount }}/adsets",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": { "parameters": [
+          { "name": "name", "value": "={{ $('Prepare context').item.json.campaignName }} - Ad set" },
+          { "name": "campaign_id", "value": "={{ $json.id }}" },
+          { "name": "daily_budget", "value": "={{ $('Prepare context').item.json.dailyBudgetMinor }}" },
+          { "name": "billing_event", "value": "IMPRESSIONS" },
+          { "name": "optimization_goal", "value": "={{ $('Prepare context').item.json.optimizationGoal }}" },
+          { "name": "bid_strategy", "value": "={{ $('Prepare context').item.json.bidStrategy }}" },
+          { "name": "targeting", "value": "={{ $('Prepare context').item.json.targeting }}" },
+          { "name": "start_time", "value": "={{ $('Prepare context').item.json.startTime }}" },
+          { "name": "status", "value": "PAUSED" },
+          { "name": "access_token", "value": "={{ $('Prepare context').item.json.accessToken }}" }
+        ] },
+        "options": {}
+      },
+      "id": "f1000000-0000-0000-0000-000000000009",
+      "name": "Create ad set",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1392, 300],
+      "notes": "daily_budget is in the account currency MINOR unit (cents for USD). Response: { id: '<adset id>' }. If Meta rejects the optimization_goal/bid_strategy combo, that's expected tuning work — the agency fixes it in Ads Manager before launch."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 1 },
+          "conditions": [ { "leftValue": "={{ $('Prepare context').item.json.pageId }}", "rightValue": "", "operator": { "type": "string", "operation": "notEmpty" } } ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f1000000-0000-0000-0000-00000000000a",
+      "name": "Has Page ID?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1616, 300],
+      "notes": "No Facebook Page -> can't build a creative or ad. Campaign + ad set are still created (PAUSED); the agency adds a Page and finishes the ad in Ads Manager, or edits the client + rebuilds."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Prepare context').item.json.apiBase }}/{{ $('Prepare context').item.json.adAccount }}/adcreatives",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": { "parameters": [
+          { "name": "name", "value": "={{ $('Prepare context').item.json.campaignName }} - Creative" },
+          { "name": "object_story_spec", "value": "={{ JSON.stringify({ page_id: $('Prepare context').item.json.pageId, link_data: { message: ($('Prepare context').item.json.primaryGoalText || ('Learn more about ' + $('Prepare context').item.json.businessName)).slice(0, 500), link: $('Prepare context').item.json.websiteUrl, name: $('Prepare context').item.json.businessName.slice(0, 40), description: 'Contact us today to get started.', call_to_action: { type: 'LEARN_MORE', value: { link: $('Prepare context').item.json.websiteUrl } } } }) }}" },
+          { "name": "access_token", "value": "={{ $('Prepare context').item.json.accessToken }}" }
+        ] },
+        "options": {}
+      },
+      "id": "f1000000-0000-0000-0000-00000000000b",
+      "name": "Create creative",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, 200],
+      "notes": "Placeholder link ad with no image (Meta will use the link's preview image, or the agency swaps in real media before launch). Response: { id: '<creative id>' }."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Prepare context').item.json.apiBase }}/{{ $('Prepare context').item.json.adAccount }}/ads",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": { "parameters": [
+          { "name": "name", "value": "={{ $('Prepare context').item.json.campaignName }} - Ad" },
+          { "name": "adset_id", "value": "={{ $('Create ad set').item.json.id }}" },
+          { "name": "creative", "value": "={{ JSON.stringify({ creative_id: $json.id }) }}" },
+          { "name": "status", "value": "PAUSED" },
+          { "name": "access_token", "value": "={{ $('Prepare context').item.json.accessToken }}" }
+        ] },
+        "options": {}
+      },
+      "id": "f1000000-0000-0000-0000-00000000000c",
+      "name": "Create ad",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2064, 200],
+      "notes": "Response: { id: '<ad id>' }."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "campaigns",
+        "matchType": "allFilters",
+        "filters": { "conditions": [ { "keyName": "id", "condition": "eq", "keyValue": "={{ $('Prepare context').item.json.campaignRowId }}" } ] },
+        "fieldsUi": { "fieldValues": [
+          { "fieldId": "status", "fieldValue": "paused" },
+          { "fieldId": "pending_review", "fieldValue": "true" },
+          { "fieldId": "error_message", "fieldValue": "" },
+          { "fieldId": "meta_campaign_id", "fieldValue": "={{ $('Create campaign').item.json.id }}" },
+          { "fieldId": "meta_adset_id", "fieldValue": "={{ $('Create ad set').item.json.id }}" },
+          { "fieldId": "meta_ad_id", "fieldValue": "={{ $('Create ad').item.json.id }}" }
+        ] }
+      },
+      "id": "f1000000-0000-0000-0000-00000000000d",
+      "name": "Mark paused (success)",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [2288, 200],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "campaigns",
+        "matchType": "allFilters",
+        "filters": { "conditions": [ { "keyName": "id", "condition": "eq", "keyValue": "={{ $('Prepare context').item.json.campaignRowId }}" } ] },
+        "fieldsUi": { "fieldValues": [
+          { "fieldId": "status", "fieldValue": "paused" },
+          { "fieldId": "pending_review", "fieldValue": "true" },
+          { "fieldId": "meta_campaign_id", "fieldValue": "={{ $('Create campaign').item.json.id }}" },
+          { "fieldId": "meta_adset_id", "fieldValue": "={{ $('Create ad set').item.json.id }}" },
+          { "fieldId": "error_message", "fieldValue": "Campaign and ad set created (paused). No Facebook Page on the client, so no ad/creative was built — add a Page ID and finish the ad in Ads Manager, or rebuild." }
+        ] }
+      },
+      "id": "f1000000-0000-0000-0000-00000000000e",
+      "name": "Mark paused (no page)",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1840, 420],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {},
+      "id": "f1000000-0000-0000-0000-00000000000f",
+      "name": "Notify: needs review",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2512, 300],
+      "notes": "Replace with your Slack/Email node. The dashboard already flags pending_review campaigns with a violet 'needs launch review' badge."
+    }
+  ],
+  "connections": {
+    "Webhook": { "main": [ [ { "node": "Validate campaign_id", "type": "main", "index": 0 } ] ] },
+    "Validate campaign_id": { "main": [ [ { "node": "Get Meta credentials", "type": "main", "index": 0 } ] ] },
+    "Get Meta credentials": { "main": [ [ { "node": "Get campaign", "type": "main", "index": 0 } ] ] },
+    "Get campaign": { "main": [ [ { "node": "Get client", "type": "main", "index": 0 } ] ] },
+    "Get client": { "main": [ [ { "node": "Prepare context", "type": "main", "index": 0 } ] ] },
+    "Prepare context": { "main": [ [ { "node": "Mark building", "type": "main", "index": 0 } ] ] },
+    "Mark building": { "main": [ [ { "node": "Create campaign", "type": "main", "index": 0 } ] ] },
+    "Create campaign": { "main": [ [ { "node": "Create ad set", "type": "main", "index": 0 } ] ] },
+    "Create ad set": { "main": [ [ { "node": "Has Page ID?", "type": "main", "index": 0 } ] ] },
+    "Has Page ID?": { "main": [ [ { "node": "Create creative", "type": "main", "index": 0 } ], [ { "node": "Mark paused (no page)", "type": "main", "index": 0 } ] ] },
+    "Create creative": { "main": [ [ { "node": "Create ad", "type": "main", "index": 0 } ] ] },
+    "Create ad": { "main": [ [ { "node": "Mark paused (success)", "type": "main", "index": 0 } ] ] },
+    "Mark paused (success)": { "main": [ [ { "node": "Notify: needs review", "type": "main", "index": 0 } ] ] },
+    "Mark paused (no page)": { "main": [ [ { "node": "Notify: needs review", "type": "main", "index": 0 } ] ] }
+  },
+  "pinData": {},
+  "meta": {}
+}

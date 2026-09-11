@@ -1,0 +1,14 @@
+# Netlify build + SPA routing config.
+# Env vars (VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY) must be set in the
+# Netlify UI: Site settings -> Environment variables. They are read at BUILD time.
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+# Single-page app: every path must fall back to index.html so React Router
+# can handle it (fixes the 404 on a hard refresh / direct link to /login etc).
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

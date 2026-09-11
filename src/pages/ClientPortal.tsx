@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 import type { PortalCampaign, PortalData, PortalMessage } from '../lib/database.types'
 import { formatDate } from '../lib/format'
+import { triggerClientMessage } from '../lib/webhooks'
 import { Button, Spinner } from '../components/ui'
 
 // Magic-link portal. Access is the client's own UUID in the URL — no login.
@@ -44,16 +45,26 @@ export default function ClientPortal() {
   async function send() {
     if (!clientId || !body.trim()) return
     setSending(true)
-    const { error } = await supabase.rpc('insert_client_message', {
+    const { data, error } = await supabase.rpc('insert_client_message', {
       p_client_id: clientId,
       p_body: body.trim(),
       p_campaign_id: scopeForNew === 'general' ? null : scopeForNew,
     })
-    setSending(false)
     if (error) {
+      setSending(false)
       setError('Sorry, your message could not be sent. Please try again.')
       return
     }
+    // Best-effort: nudge n8n to draft a reply. The message is already saved;
+    // don't fail the send if the webhook is unreachable.
+    if (typeof data === 'string') {
+      try {
+        await triggerClientMessage(data)
+      } catch {
+        /* the agency will still see the message on their dashboard */
+      }
+    }
+    setSending(false)
     setBody('')
     setSent(true)
     setTimeout(() => setSent(false), 4000)

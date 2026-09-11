@@ -1,0 +1,206 @@
+{
+  "name": "Meta - send-reply",
+  "nodes": [
+    {
+      "parameters": { "httpMethod": "POST", "path": "meta-send-reply", "options": {} },
+      "id": "d1000000-0000-0000-0000-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-4608, 2800],
+      "webhookId": "meta-send-reply",
+      "notes": "Called by MessageThread.tsx 'Approve & send'. Payload: { message_id }. The frontend PATCHes messages.ai_draft_body with the (edited) text FIRST, then fires this. This workflow reads ai_draft_body as the outbound body. Async."
+    },
+    {
+      "parameters": {
+        "jsCode": "const id = $json.body.message_id;\nconst uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;\nif (typeof id !== 'string' || !uuidRe.test(id)) {\n  throw new Error('message_id missing or not a valid UUID: ' + JSON.stringify(id));\n}\nreturn [{ json: { message_id: id } }];\n"
+      },
+      "id": "d1000000-0000-0000-0000-000000000002",
+      "name": "Validate message_id",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-4384, 2800]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "tableId": "messages",
+        "filters": { "conditions": [ { "keyName": "id", "keyValue": "={{ $json.message_id }}" } ] }
+      },
+      "id": "d1000000-0000-0000-0000-000000000003",
+      "name": "Get message",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [-4160, 2800],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 1 },
+          "conditions": [ { "leftValue": "={{ !!$json.proposed_action }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } } ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d1000000-0000-0000-0000-000000000004",
+      "name": "Has proposed_action?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-3936, 2800]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "tableId": "campaigns",
+        "filters": { "conditions": [ { "keyName": "id", "keyValue": "={{ $('Get message').item.json.campaign_id }}" } ] }
+      },
+      "id": "d1000000-0000-0000-0000-000000000005",
+      "name": "Get campaign for action",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [-3712, 2656],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": { "operation": "getAll", "tableId": "meta_ads_settings", "limit": 1, "filterType": "none" },
+      "id": "d1000000-0000-0000-0000-000000000006",
+      "name": "Get Meta credentials",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [-3488, 2656],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const campaign = $('Get campaign for action').item.json;\nif (!campaign || !campaign.id) throw new Error('No campaign linked to this message (messages.campaign_id is empty) — cannot apply the proposed action.');\nconst token = $('Get Meta credentials').item.json.system_user_token;\nif (!token) throw new Error('meta_ads_settings.system_user_token is not set.');\nconst API = 'https://graph.facebook.com/v21.0';\nconst action = $('Get message').item.json.proposed_action;\nif (!action || !action.action_type) throw new Error('No proposed_action on this message.');\n\nconst campaignId = campaign.meta_campaign_id;\nconst adsetId = campaign.meta_adset_id;\nconst adId = campaign.meta_ad_id;\nconst ops = [];\nlet campaignStatusValue = campaign.status;\nlet newBudgetUsd = campaign.daily_budget_usd;\n\nif (action.action_type === 'update_daily_budget') {\n  if (typeof action.daily_budget_usd !== 'number') throw new Error('proposed_action.daily_budget_usd is missing or not a number.');\n  if (!adsetId) throw new Error('This campaign has no meta_adset_id on file.');\n  ops.push({ url: API + '/' + adsetId, form: { daily_budget: String(Math.round(action.daily_budget_usd * 100)) } });\n  newBudgetUsd = action.daily_budget_usd;\n} else if (action.action_type === 'pause_campaign') {\n  if (!campaignId) throw new Error('This campaign has no meta_campaign_id on file.');\n  ops.push({ url: API + '/' + campaignId, form: { status: 'PAUSED' } });\n  campaignStatusValue = 'paused';\n} else if (action.action_type === 'resume_campaign') {\n  if (!campaignId) throw new Error('This campaign has no meta_campaign_id on file.');\n  ops.push({ url: API + '/' + campaignId, form: { status: 'ACTIVE' } });\n  if (adsetId) ops.push({ url: API + '/' + adsetId, form: { status: 'ACTIVE' } });\n  if (adId) ops.push({ url: API + '/' + adId, form: { status: 'ACTIVE' } });\n  campaignStatusValue = 'active';\n} else {\n  throw new Error('Unknown proposed_action.action_type: ' + action.action_type);\n}\n\nreturn ops.map(op => ({ json: { url: op.url, form: op.form, access_token: token, campaignRowId: campaign.id, actionType: action.action_type, campaignStatusValue, newBudgetUsd } }));\n"
+      },
+      "id": "d1000000-0000-0000-0000-000000000007",
+      "name": "Build Meta ops",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-3264, 2656]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            { "name": "status", "value": "={{ $json.form.status || '' }}" },
+            { "name": "daily_budget", "value": "={{ $json.form.daily_budget || '' }}" },
+            { "name": "access_token", "value": "={{ $json.access_token }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d1000000-0000-0000-0000-000000000008",
+      "name": "Apply on Meta",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-3040, 2656]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 1 },
+          "conditions": [ { "leftValue": "={{ $('Build Meta ops').first().json.actionType }}", "rightValue": "update_daily_budget", "operator": { "type": "string", "operation": "equals" } } ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d1000000-0000-0000-0000-000000000009",
+      "name": "Is budget update?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-2816, 2656]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "campaigns",
+        "matchType": "allFilters",
+        "filters": { "conditions": [ { "keyName": "id", "condition": "eq", "keyValue": "={{ $('Get campaign for action').item.json.id }}" } ] },
+        "fieldsUi": { "fieldValues": [ { "fieldId": "daily_budget_usd", "fieldValue": "={{ $('Build Meta ops').first().json.newBudgetUsd }}" } ] }
+      },
+      "id": "d1000000-0000-0000-0000-00000000000a",
+      "name": "Update campaign budget",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [-2592, 2560],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "campaigns",
+        "matchType": "allFilters",
+        "filters": { "conditions": [ { "keyName": "id", "condition": "eq", "keyValue": "={{ $('Get campaign for action').item.json.id }}" } ] },
+        "fieldsUi": { "fieldValues": [ { "fieldId": "status", "fieldValue": "={{ $('Build Meta ops').first().json.campaignStatusValue }}" }, { "fieldId": "pending_review", "fieldValue": "false" } ] }
+      },
+      "id": "d1000000-0000-0000-0000-00000000000b",
+      "name": "Update campaign status",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [-2592, 2752],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "tableId": "messages",
+        "fieldsUi": {
+          "fieldValues": [
+            { "fieldId": "client_id", "fieldValue": "={{ $('Get message').item.json.client_id }}" },
+            { "fieldId": "campaign_id", "fieldValue": "={{ $('Get message').item.json.campaign_id }}" },
+            { "fieldId": "direction", "fieldValue": "outbound" },
+            { "fieldId": "channel", "fieldValue": "in_app" },
+            { "fieldId": "body", "fieldValue": "={{ $('Get message').item.json.ai_draft_body }}" },
+            { "fieldId": "status", "fieldValue": "sent" },
+            { "fieldId": "sent_at", "fieldValue": "={{ new Date().toISOString() }}" }
+          ]
+        }
+      },
+      "id": "d1000000-0000-0000-0000-00000000000c",
+      "name": "Insert outbound message",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [-3264, 3040],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } },
+      "notes": "The approved reply becomes a NEW outbound row (body = the edited ai_draft_body). The client sees it on their next portal load."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "messages",
+        "matchType": "allFilters",
+        "filters": { "conditions": [ { "keyName": "id", "condition": "eq", "keyValue": "={{ $('Validate message_id').item.json.message_id }}" } ] },
+        "fieldsUi": { "fieldValues": [ { "fieldId": "status", "fieldValue": "sent" }, { "fieldId": "sent_at", "fieldValue": "={{ new Date().toISOString() }}" } ] }
+      },
+      "id": "d1000000-0000-0000-0000-00000000000d",
+      "name": "Mark inbound message replied",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [-3040, 3040],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } },
+      "notes": "Marks the original inbound/draft row status='sent' so MessageThread.tsx stops showing its edit box."
+    }
+  ],
+  "connections": {
+    "Webhook": { "main": [ [ { "node": "Validate message_id", "type": "main", "index": 0 } ] ] },
+    "Validate message_id": { "main": [ [ { "node": "Get message", "type": "main", "index": 0 } ] ] },
+    "Get message": { "main": [ [ { "node": "Has proposed_action?", "type": "main", "index": 0 } ] ] },
+    "Has proposed_action?": { "main": [ [ { "node": "Get campaign for action", "type": "main", "index": 0 } ], [ { "node": "Insert outbound message", "type": "main", "index": 0 } ] ] },
+    "Get campaign for action": { "main": [ [ { "node": "Get Meta credentials", "type": "main", "index": 0 } ] ] },
+    "Get Meta credentials": { "main": [ [ { "node": "Build Meta ops", "type": "main", "index": 0 } ] ] },
+    "Build Meta ops": { "main": [ [ { "node": "Apply on Meta", "type": "main", "index": 0 } ] ] },
+    "Apply on Meta": { "main": [ [ { "node": "Is budget update?", "type": "main", "index": 0 } ] ] },
+    "Is budget update?": { "main": [ [ { "node": "Update campaign budget", "type": "main", "index": 0 } ], [ { "node": "Update campaign status", "type": "main", "index": 0 } ] ] },
+    "Update campaign budget": { "main": [ [ { "node": "Insert outbound message", "type": "main", "index": 0 } ] ] },
+    "Update campaign status": { "main": [ [ { "node": "Insert outbound message", "type": "main", "index": 0 } ] ] },
+    "Insert outbound message": { "main": [ [ { "node": "Mark inbound message replied", "type": "main", "index": 0 } ] ] }
+  },
+  "pinData": {},
+  "meta": {}
+}

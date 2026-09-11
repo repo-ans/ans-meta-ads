@@ -36,7 +36,7 @@ export interface Campaign {
   primary_goal: string | null
   business_objective: string | null
   objective: MetaObjective
-  daily_budget_cents: number | null
+  daily_budget_usd: number | null
   bid_strategy: string
   targeting_countries: string[] | null
   targeting_age_min: number | null
@@ -72,7 +72,7 @@ export interface Recommendation {
   campaign_id: string
   type: string | null
   dollars_recoverable: number | null
-  meta_resource_id: string | null
+  resource_name: string | null
   status: RecommendationStatus
   synced_at: string
 }
@@ -96,7 +96,7 @@ export interface Message {
   subject: string | null
   body: string | null
   ai_draft_body: string | null
-  proposed_action: Record<string, unknown> | null
+  proposed_action: ProposedAction | null
   status: MessageStatus
   created_at: string
   sent_at: string | null
@@ -121,15 +121,20 @@ export interface MetaAdsSettings {
   singleton: boolean
 }
 
-// Shape n8n is expected to write into proposed_action. Rendered as a diff
-// preview before the agency confirms — never auto-applied.
+// Shape the n8n AI agents write into proposed_action (identical contract in
+// `messages` and `campaign_chat_messages`, and shared with the Google Ads
+// sibling system). Rendered as a preview; applied ONLY via the
+// apply-campaign-action / send-reply webhooks — the browser never mutates the
+// campaign row itself.
+export type ProposedActionType =
+  | 'update_daily_budget'
+  | 'pause_campaign'
+  | 'resume_campaign'
+
 export interface ProposedAction {
-  kind: string // e.g. 'increase_budget', 'pause_adset', 'update_targeting'
-  summary: string // human sentence, e.g. "Increase daily budget from $50 to $75"
-  table?: string // table the frontend should update on confirm
-  row_id?: string
-  patch?: Record<string, unknown> // column -> new value
-  before?: Record<string, unknown> // column -> current value, for the diff
+  action_type: ProposedActionType
+  daily_budget_usd: number | null // required for update_daily_budget, else null
+  reason: string
 }
 
 // --- Client portal RPC return shapes ---

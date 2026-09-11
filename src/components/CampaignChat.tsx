@@ -1,22 +1,40 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { supabase } from '../lib/supabase'
-import type { CampaignChatMessage, ProposedAction } from '../lib/database.types'
+import type { CampaignChatMessage } from '../lib/database.types'
 import { formatDateTime } from '../lib/format'
+import {
+  applyCampaignAction,
+  sendCampaignChat,
+  WebhookError,
+} from '../lib/webhooks'
 import { Button, Spinner, TextArea } from './ui'
 import { ProposedActionPreview } from './ProposedActionPreview'
 
 /**
- * Agency-facing AI assistant for a single campaign. This component only
- * reads/writes `campaign_chat_messages` and applies confirmed actions to the
- * target Supabase row. A separate n8n webhook is expected to watch for new
- * `role='user'` rows and insert `role='assistant'` replies (optionally with a
- * `proposed_action`). This UI does not call that webhook.
+ * Agency-facing AI assistant for a single campaign.
+ *
+ * Send flow: POST { campaign_id, message } to the `campaign-chat` webhook.
+ * n8n inserts BOTH the user row and the assistant reply — this component does
+ * not write the user row itself (it would double up). The reply comes back
+ * synchronously; a realtime subscription also keeps the thread fresh.
+ *
+ * Apply flow: POST { campaign_id, chat_message_id, proposed_action } to the
+ * `apply-campaign-action` webhook. n8n does the Meta-side change and writes
+ * `campaign_chat_messages.action_status`. The browser never mutates the
+ * campaign row itself.
  */
-export function CampaignChat({ campaignId }: { campaignId: string }) {
+export function CampaignChat({
+  campaignId,
+  currentBudgetUsd,
+}: {
+  campaignId: string
+  currentBudgetUsd?: number | null
+}) {
   const [messages, setMessages] = useState<CampaignChatMessage[]>([])
   const [loading, setLoading] = useState(true)
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
+  const [pendingUserMsg, setPendingUserMsg] = useState<string | null>(null)
   const [applyingId, setApplyingId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -54,23 +72,28 @@ export function CampaignChat({ campaignId }: { campaignId: string }) {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  }, [messages, pendingUserMsg])
 
   async function send() {
     const content = draft.trim()
     if (!content) return
     setSending(true)
     setError(null)
-    const { error } = await supabase.from('campaign_chat_messages').insert({
-      campaign_id: campaignId,
-      role: 'user',
-      content,
-    })
-    setSending(false)
-    if (error) setError(error.message)
-    else {
-      setDraft('')
-      load()
+    setDraft('')
+    setPendingUserMsg(content)
+    try {
+      await sendCampaignChat(campaignId, content)
+      await load()
+    } catch (e) {
+      setError(
+        e instanceof WebhookError
+          ? e.message
+          : 'Could not reach the assistant. Try again.',
+      )
+      setDraft(content) // let them retry
+    } finally {
+      setSending(false)
+      setPendingUserMsg(null)
     }
   }
 
@@ -94,26 +117,20 @@ export function CampaignChat({ campaignId }: { campaignId: string }) {
   }
 
   async function applyAction(msg: CampaignChatMessage) {
-    const action = msg.proposed_action
-    if (!action) return
+    if (!msg.proposed_action) return
     setApplyingId(msg.id)
     setError(null)
     try {
-      if (action.table && action.row_id && action.patch) {
-        const { error } = await supabase
-          .from(action.table)
-          .update(action.patch)
-          .eq('id', action.row_id)
-        if (error) throw error
-      }
-      const { error: markErr } = await supabase
-        .from('campaign_chat_messages')
-        .update({ action_status: 'applied' })
-        .eq('id', msg.id)
-      if (markErr) throw markErr
-      load()
+      await applyCampaignAction({
+        campaignId,
+        proposedAction: msg.proposed_action,
+        chatMessageId: msg.id,
+      })
+      await load()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to apply the change.')
+      setError(
+        e instanceof WebhookError ? e.message : 'Failed to apply the change.',
+      )
     } finally {
       setApplyingId(null)
     }
@@ -140,7 +157,7 @@ export function CampaignChat({ campaignId }: { campaignId: string }) {
       <div className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
         {loading ? (
           <Spinner label="Loading conversation…" />
-        ) : messages.length === 0 ? (
+        ) : messages.length === 0 && !pendingUserMsg ? (
           <p className="text-sm text-slate-500">
             Ask the assistant about this campaign — budget pacing, targeting, fatigue,
             what to change. Proposed changes are shown as a preview for you to confirm.
@@ -150,12 +167,22 @@ export function CampaignChat({ campaignId }: { campaignId: string }) {
             <ChatBubble
               key={m.id}
               message={m}
+              currentBudgetUsd={currentBudgetUsd}
               applying={applyingId === m.id}
               onApply={() => applyAction(m)}
               onDismiss={() => dismissAction(m)}
               onDelete={() => deleteMessage(m.id)}
             />
           ))
+        )}
+        {pendingUserMsg && (
+          <div className="flex justify-end">
+            <div className="max-w-[85%] rounded-2xl bg-brand-600/70 px-3.5 py-2 text-sm text-white">
+              {pendingUserMsg}
+              <span className="ml-2 opacity-70">·</span>
+              <span className="ml-1 text-xs opacity-70">sending…</span>
+            </div>
+          </div>
         )}
         <div ref={bottomRef} />
       </div>
@@ -189,19 +216,21 @@ export function CampaignChat({ campaignId }: { campaignId: string }) {
 
 function ChatBubble({
   message,
+  currentBudgetUsd,
   applying,
   onApply,
   onDismiss,
   onDelete,
 }: {
   message: CampaignChatMessage
+  currentBudgetUsd?: number | null
   applying: boolean
   onApply: () => void
   onDismiss: () => void
   onDelete: () => void
 }) {
   const isUser = message.role === 'user'
-  const action = message.proposed_action as ProposedAction | null
+  const action = message.proposed_action
   return (
     <div className={`group flex ${isUser ? 'justify-end' : 'justify-start'}`}>
       <div className={`max-w-[85%] space-y-2 ${isUser ? 'items-end' : 'items-start'}`}>
@@ -217,7 +246,7 @@ function ChatBubble({
 
         {action && (
           <div className="space-y-2">
-            <ProposedActionPreview action={action} />
+            <ProposedActionPreview action={action} currentBudgetUsd={currentBudgetUsd} />
             {message.action_status === 'applied' ? (
               <p className="text-xs font-medium text-green-700">✓ Applied</p>
             ) : message.action_status === 'dismissed' ? (

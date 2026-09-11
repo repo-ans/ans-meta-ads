@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 import type { Campaign, Client } from '../lib/database.types'
-import { formatCents, formatDate } from '../lib/format'
+import { formatMoney, formatDate } from '../lib/format'
 import { DashboardLayout } from '../components/layout/DashboardLayout'
 import { CampaignStatusBadge } from '../components/CampaignStatusBadge'
 import { EditClientModal } from '../components/EditClientModal'
@@ -173,7 +173,7 @@ export default function ClientDetail() {
                     )}
                   </td>
                   <td className="px-4 py-3 text-xs text-slate-600">{c.objective}</td>
-                  <td className="px-4 py-3">{formatCents(c.daily_budget_cents)}</td>
+                  <td className="px-4 py-3">{formatMoney(c.daily_budget_usd)}</td>
                   <td className="px-4 py-3">
                     <CampaignStatusBadge
                       status={c.status}

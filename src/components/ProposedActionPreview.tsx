@@ -1,52 +1,51 @@
 import type { ProposedAction } from '../lib/database.types'
-import { formatCents } from '../lib/format'
+import { formatMoney } from '../lib/format'
 
-// Renders a proposed_action as a clear before/after diff. Never applies anything
-// itself — the parent owns the confirm handler.
-export function ProposedActionPreview({ action }: { action: ProposedAction }) {
-  const rows = diffRows(action)
+// Renders a proposed_action as a clear before/after preview. Never applies
+// anything itself — the parent owns the confirm handler, which fires the
+// apply-campaign-action / send-reply webhook.
+export function ProposedActionPreview({
+  action,
+  currentBudgetUsd,
+}: {
+  action: ProposedAction
+  currentBudgetUsd?: number | null
+}) {
   return (
     <div className="rounded-lg border border-brand-200 bg-brand-50 p-3">
       <p className="text-xs font-semibold uppercase tracking-wide text-brand-700">
         Proposed change
       </p>
-      <p className="mt-1 text-sm font-medium text-slate-800">{action.summary}</p>
-      {rows.length > 0 && (
-        <table className="mt-2 w-full text-sm">
-          <tbody>
-            {rows.map((r) => (
-              <tr key={r.field}>
-                <td className="py-0.5 pr-3 text-slate-500">{r.label}</td>
-                <td className="py-0.5 pr-2 text-slate-400 line-through">{r.before}</td>
-                <td className="py-0.5 pr-2 text-slate-400">→</td>
-                <td className="py-0.5 font-medium text-slate-900">{r.after}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <p className="mt-1 text-sm font-medium text-slate-800">{title(action)}</p>
+
+      {action.action_type === 'update_daily_budget' && (
+        <p className="mt-1 text-sm">
+          <span className="text-slate-400 line-through">
+            {currentBudgetUsd != null ? formatMoney(currentBudgetUsd) : 'current budget'}
+          </span>
+          <span className="mx-2 text-slate-400">→</span>
+          <span className="font-semibold text-slate-900">
+            {formatMoney(action.daily_budget_usd)} / day
+          </span>
+        </p>
+      )}
+
+      {action.reason && (
+        <p className="mt-1.5 text-xs text-slate-500">{action.reason}</p>
       )}
     </div>
   )
 }
 
-function looksLikeCents(field: string): boolean {
-  return /_cents$/.test(field) || /budget/i.test(field)
-}
-
-function fmt(field: string, value: unknown): string {
-  if (value == null) return '—'
-  if (looksLikeCents(field) && typeof value === 'number') return formatCents(value)
-  if (Array.isArray(value)) return value.join(', ')
-  return String(value)
-}
-
-function diffRows(action: ProposedAction) {
-  const patch = action.patch ?? {}
-  const before = action.before ?? {}
-  return Object.keys(patch).map((field) => ({
-    field,
-    label: field.replace(/_/g, ' ').replace(/ cents$/, ''),
-    before: fmt(field, before[field]),
-    after: fmt(field, patch[field]),
-  }))
+function title(a: ProposedAction): string {
+  switch (a.action_type) {
+    case 'update_daily_budget':
+      return `Change the daily budget to ${formatMoney(a.daily_budget_usd)}`
+    case 'pause_campaign':
+      return 'Pause this campaign'
+    case 'resume_campaign':
+      return 'Resume this campaign'
+    default:
+      return 'Proposed change'
+  }
 }

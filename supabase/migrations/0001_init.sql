@@ -50,7 +50,7 @@ create table if not exists public.campaigns (
   primary_goal        text,   -- intake concept; nullable, not set on discovered campaigns
   business_objective  text,   -- intake concept; nullable
   objective           text not null default 'OUTCOME_LEADS',
-  daily_budget_cents  integer,
+  daily_budget_usd    numeric,   -- plain dollars (matches the Google Ads sibling system)
   bid_strategy        text not null default 'LOWEST_COST_WITHOUT_CAP',
   targeting_countries text[],
   targeting_age_min   integer,
@@ -110,7 +110,7 @@ create table if not exists public.recommendations (
   campaign_id          uuid not null references public.campaigns (id) on delete cascade,
   type                 text,
   dollars_recoverable  numeric,
-  meta_resource_id     text unique,
+  resource_name        text unique,   -- Meta's own recommendation resource id
   status               text not null default 'open'
                          check (status in ('open','applied','dismissed')),
   synced_at            timestamptz not null default now()
@@ -185,18 +185,8 @@ create table if not exists public.meta_ads_settings (
   singleton            boolean not null default true unique
 );
 
--- ---------------------------------------------------------------------------
--- sync_requests  (ADDITION beyond the original spec)
--- The dashboard "Sync Now" button writes a row here; an n8n trigger polls the
--- table and runs the Meta pull on demand. The frontend never calls Meta.
--- Drop this table if the n8n side prefers a webhook instead.
--- ---------------------------------------------------------------------------
-create table if not exists public.sync_requests (
-  id           uuid primary key default gen_random_uuid(),
-  source       text,
-  requested_at timestamptz not null default now(),
-  processed_at timestamptz
-);
+-- Note: the dashboard "Sync Now" button POSTs directly to the n8n `sync-now`
+-- webhook — there is no sync_requests table.
 
 -- ===========================================================================
 -- Row Level Security
@@ -209,7 +199,6 @@ alter table public.alerts                enable row level security;
 alter table public.messages              enable row level security;
 alter table public.campaign_chat_messages enable row level security;
 alter table public.meta_ads_settings     enable row level security;
-alter table public.sync_requests         enable row level security;
 
 -- Public intake: anon may INSERT clients + campaigns only.
 create policy "anon can insert clients"  on public.clients
@@ -232,9 +221,6 @@ begin
     );
   end loop;
 end $$;
-
-create policy "authenticated full access" on public.sync_requests
-  for all to authenticated using (true) with check (true);
 
 -- meta_ads_settings: authenticated read/write, but keep it explicit & separate
 -- so it is easy to lock down further later (e.g. to a specific admin uid).

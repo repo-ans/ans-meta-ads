@@ -1,0 +1,217 @@
+{
+  "name": "Meta - campaign-chat",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "meta-campaign-chat",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "a1000000-0000-0000-0000-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-960, 48],
+      "webhookId": "meta-campaign-chat",
+      "notes": "Called by CampaignChat.tsx. Payload: { campaign_id, message }. Path is 'meta-campaign-chat' so it doesn't collide with the Google Ads 'campaign-chat' webhook on the same n8n instance. Set VITE_N8N_WEBHOOK_BASE + this path in src/lib/webhooks.ts (sendCampaignChat)."
+    },
+    {
+      "parameters": {
+        "jsCode": "const campaignId = $json.body.campaign_id;\nconst message = $json.body.message;\nconst uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;\nif (typeof campaignId !== 'string' || !uuidRe.test(campaignId)) {\n  throw new Error('campaign_id missing or not a valid UUID: ' + JSON.stringify(campaignId));\n}\nif (typeof message !== 'string' || !message.trim()) {\n  throw new Error('message missing or empty');\n}\nreturn [{ json: { campaign_id: campaignId, message: message.trim() } }];\n"
+      },
+      "id": "a1000000-0000-0000-0000-000000000002",
+      "name": "Validate input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-736, 48]
+    },
+    {
+      "parameters": {
+        "tableId": "campaign_chat_messages",
+        "fieldsUi": {
+          "fieldValues": [
+            { "fieldId": "campaign_id", "fieldValue": "={{ $json.campaign_id }}" },
+            { "fieldId": "role", "fieldValue": "user" },
+            { "fieldId": "content", "fieldValue": "={{ $json.message }}" }
+          ]
+        }
+      },
+      "id": "a1000000-0000-0000-0000-000000000003",
+      "name": "Insert user message",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [-512, 48],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } },
+      "notes": "The frontend does NOT insert the user row (it just POSTs here) — this node is the single writer for role='user', same as the Google Ads version."
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "tableId": "campaigns",
+        "filters": { "conditions": [ { "keyName": "id", "keyValue": "={{ $('Validate input').item.json.campaign_id }}" } ] }
+      },
+      "id": "a1000000-0000-0000-0000-000000000004",
+      "name": "Get campaign",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [-288, 48],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "campaign_metrics",
+        "limit": 90,
+        "filters": { "conditions": [ { "keyName": "campaign_id", "condition": "eq", "keyValue": "={{ $('Validate input').item.json.campaign_id }}" } ] }
+      },
+      "id": "a1000000-0000-0000-0000-000000000005",
+      "name": "Get campaign metrics",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [-64, 48],
+      "alwaysOutputData": true,
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "recommendations",
+        "limit": 20,
+        "matchType": "allFilters",
+        "filters": { "conditions": [ { "keyName": "campaign_id", "condition": "eq", "keyValue": "={{ $('Validate input').item.json.campaign_id }}" }, { "keyName": "status", "condition": "eq", "keyValue": "open" } ] }
+      },
+      "id": "a1000000-0000-0000-0000-000000000006",
+      "name": "Get open recommendations",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [160, 48],
+      "alwaysOutputData": true,
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "campaign_chat_messages",
+        "filters": { "conditions": [ { "keyName": "campaign_id", "condition": "eq", "keyValue": "={{ $('Validate input').item.json.campaign_id }}" } ] }
+      },
+      "id": "a1000000-0000-0000-0000-000000000007",
+      "name": "Get recent chat history",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [384, 48],
+      "alwaysOutputData": true,
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const campaign = $('Get campaign').item.json;\nconst metricsRows = $('Get campaign metrics').all().map(i => i.json).filter(m => m && m.id);\nconst recRows = $('Get open recommendations').all().map(i => i.json).filter(r => r && r.id);\nconst historyRows = $('Get recent chat history').all().map(i => i.json).filter(h => h && h.id)\n  .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))\n  .slice(-20);\n\nconst totals = metricsRows.reduce((acc, m) => {\n  acc.spend += Number(m.spend || 0);\n  acc.results += Number(m.results || 0);\n  acc.roasSum += m.roas != null ? Number(m.roas) : 0;\n  acc.roasN += m.roas != null ? 1 : 0;\n  return acc;\n}, { spend: 0, results: 0, roasSum: 0, roasN: 0 });\nconst costPerResult = totals.results > 0 ? totals.spend / totals.results : null;\nconst roas = totals.roasN > 0 ? totals.roasSum / totals.roasN : null;\n\nconst historyText = historyRows.length\n  ? historyRows.map(h => (h.role === 'user' ? 'Agency' : 'Assistant') + ': ' + h.content).join('\\n')\n  : '(no prior messages)';\nconst recsText = recRows.length\n  ? recRows.map(r => '- ' + (r.type || 'recommendation') + (r.dollars_recoverable != null ? ': $' + r.dollars_recoverable + ' recoverable' : '')).join('\\n')\n  : 'None currently open.';\n\nreturn [{ json: {\n  campaignName: campaign.campaign_name,\n  status: campaign.status,\n  dailyBudgetUsd: campaign.daily_budget_usd,\n  objective: campaign.objective,\n  totalSpend: totals.spend,\n  totalResults: totals.results,\n  costPerResult,\n  roas,\n  recommendationsText: recsText,\n  historyText,\n  userMessage: $('Validate input').item.json.message,\n} }];\n"
+      },
+      "id": "a1000000-0000-0000-0000-000000000008",
+      "name": "Build AI context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [608, 48],
+      "notes": "Meta metrics shape: spend / results / roas (from campaign_metrics), not Google's cost / conversions / conversions_value."
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Campaign: {{ $json.campaignName }} (status: {{ $json.status }}, objective {{ $json.objective }}, daily budget ${{ $json.dailyBudgetUsd }}).\nPerformance to date: spend ${{ $json.totalSpend }}, results {{ $json.totalResults }}, cost per result {{ $json.costPerResult || 'n/a' }}, ROAS {{ $json.roas || 'n/a' }}.\n\nOpen Meta recommendations:\n{{ $json.recommendationsText }}\n\nRecent conversation:\n{{ $json.historyText }}\n\nAgency's new message:\n{{ $json.userMessage }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are an AI assistant helping a Meta (Facebook/Instagram) Ads agency manage this specific campaign, inside their internal dashboard. You are talking to the agency's own staff, not the end client — be direct and technical. Use the performance data and open recommendations given to you; cite the real numbers provided, never invent data.\n\nproposed_action must be null UNLESS the agency is clearly asking for one of exactly these three changes:\n- \"update_daily_budget\": raise/lower/set the daily budget to a specific dollar amount. daily_budget_usd required, a plain number. If no specific number is given, ask a clarifying question and leave proposed_action null.\n- \"pause_campaign\": pause the campaign.\n- \"resume_campaign\": resume a paused campaign.\n\nFor update_daily_budget, daily_budget_usd is required. For pause_campaign/resume_campaign set daily_budget_usd to null. Always include a one-sentence reason. Never claim a change has already been made — say it's ready to apply and awaiting confirmation. Anything else (targeting, creative, general questions) gets proposed_action: null and a normal answer."
+        }
+      },
+      "id": "a1000000-0000-0000-0000-000000000009",
+      "name": "Chat (AI Agent)",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [832, 48]
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"reply\": { \"type\": \"string\" },\n    \"proposed_action\": {\n      \"type\": [\"object\", \"null\"],\n      \"properties\": {\n        \"action_type\": { \"type\": \"string\", \"enum\": [\"update_daily_budget\", \"pause_campaign\", \"resume_campaign\"] },\n        \"daily_budget_usd\": { \"type\": [\"number\", \"null\"] },\n        \"reason\": { \"type\": \"string\" }\n      },\n      \"required\": [\"action_type\", \"daily_budget_usd\", \"reason\"]\n    }\n  },\n  \"required\": [\"reply\", \"proposed_action\"]\n}"
+      },
+      "id": "a1000000-0000-0000-0000-00000000000a",
+      "name": "Structured Output Parser",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [992, 272]
+    },
+    {
+      "parameters": {
+        "model": { "__rl": true, "mode": "list", "value": "gpt-5-mini" },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [800, 272],
+      "id": "a1000000-0000-0000-0000-00000000000b",
+      "name": "OpenAI Chat Model",
+      "credentials": { "openAiApi": { "id": "fj3WhBV98VkK9qr3", "name": "Manam- OpenAi account" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const output = $json.output;\nreturn [{ json: {\n  content: output.reply,\n  proposedAction: output.proposed_action || null,\n  actionStatus: output.proposed_action ? 'proposed' : null,\n} }];\n"
+      },
+      "id": "a1000000-0000-0000-0000-00000000000c",
+      "name": "Prepare assistant message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 48]
+    },
+    {
+      "parameters": {
+        "tableId": "campaign_chat_messages",
+        "fieldsUi": {
+          "fieldValues": [
+            { "fieldId": "campaign_id", "fieldValue": "={{ $('Validate input').item.json.campaign_id }}" },
+            { "fieldId": "role", "fieldValue": "assistant" },
+            { "fieldId": "content", "fieldValue": "={{ $json.content }}" },
+            { "fieldId": "proposed_action", "fieldValue": "={{ $json.proposedAction }}" },
+            { "fieldId": "action_status", "fieldValue": "={{ $json.actionStatus }}" }
+          ]
+        }
+      },
+      "id": "a1000000-0000-0000-0000-00000000000d",
+      "name": "Insert assistant message",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1344, 48],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ id: $json.id, content: $json.content, proposed_action: $json.proposed_action, action_status: $json.action_status }) }}",
+        "options": {}
+      },
+      "id": "a1000000-0000-0000-0000-00000000000e",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1568, 48],
+      "notes": "Returns the assistant turn synchronously so the frontend renders it immediately. If the field names on $json here come back wrong, check what 'Insert assistant message' actually output."
+    }
+  ],
+  "connections": {
+    "Webhook": { "main": [ [ { "node": "Validate input", "type": "main", "index": 0 } ] ] },
+    "Validate input": { "main": [ [ { "node": "Insert user message", "type": "main", "index": 0 } ] ] },
+    "Insert user message": { "main": [ [ { "node": "Get campaign", "type": "main", "index": 0 } ] ] },
+    "Get campaign": { "main": [ [ { "node": "Get campaign metrics", "type": "main", "index": 0 } ] ] },
+    "Get campaign metrics": { "main": [ [ { "node": "Get open recommendations", "type": "main", "index": 0 } ] ] },
+    "Get open recommendations": { "main": [ [ { "node": "Get recent chat history", "type": "main", "index": 0 } ] ] },
+    "Get recent chat history": { "main": [ [ { "node": "Build AI context", "type": "main", "index": 0 } ] ] },
+    "Build AI context": { "main": [ [ { "node": "Chat (AI Agent)", "type": "main", "index": 0 } ] ] },
+    "Chat (AI Agent)": { "main": [ [ { "node": "Prepare assistant message", "type": "main", "index": 0 } ] ] },
+    "Structured Output Parser": { "ai_outputParser": [ [ { "node": "Chat (AI Agent)", "type": "ai_outputParser", "index": 0 } ] ] },
+    "OpenAI Chat Model": { "ai_languageModel": [ [ { "node": "Chat (AI Agent)", "type": "ai_languageModel", "index": 0 } ] ] },
+    "Prepare assistant message": { "main": [ [ { "node": "Insert assistant message", "type": "main", "index": 0 } ] ] },
+    "Insert assistant message": { "main": [ [ { "node": "Respond to Webhook", "type": "main", "index": 0 } ] ] }
+  },
+  "pinData": {},
+  "meta": {}
+}

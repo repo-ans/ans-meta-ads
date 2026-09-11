@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
-import type { Campaign, CampaignMetric, Client } from '../lib/database.types'
-import {
-  formatCents,
-  formatMoney,
-  formatNumber,
-  formatRoas,
-  pctChange,
-} from '../lib/format'
+import type {
+  Campaign,
+  CampaignMetric,
+  Client,
+  ProposedActionType,
+} from '../lib/database.types'
+import { formatMoney, formatNumber, formatRoas, pctChange } from '../lib/format'
+import { applyCampaignAction, WebhookError } from '../lib/webhooks'
 import { DashboardLayout } from '../components/layout/DashboardLayout'
 import { CampaignStatusBadge } from '../components/CampaignStatusBadge'
 import { AlertsList } from '../components/AlertsList'
@@ -82,18 +82,32 @@ export default function CampaignDetail() {
     load()
   }, [load])
 
-  async function updateStatus(patch: Partial<Campaign>) {
+  // Status changes go through the apply-campaign-action webhook so the change
+  // actually happens on Meta (and pending_review is cleared server-side). The
+  // browser never flips campaigns.status directly.
+  async function runCampaignAction(actionType: ProposedActionType, reason: string) {
     if (!campaign) return
     setStatusBusy(true)
-    const { data, error } = await supabase
-      .from('campaigns')
-      .update(patch)
-      .eq('id', campaign.id)
-      .select()
-      .single()
-    setStatusBusy(false)
-    if (error) setError(error.message)
-    else setCampaign(data as Campaign)
+    setError(null)
+    try {
+      await applyCampaignAction({
+        campaignId: campaign.id,
+        proposedAction: {
+          action_type: actionType,
+          daily_budget_usd: null,
+          reason,
+        },
+      })
+      await load()
+    } catch (e) {
+      setError(
+        e instanceof WebhookError
+          ? e.message
+          : 'Could not apply the change on Meta.',
+      )
+    } finally {
+      setStatusBusy(false)
+    }
   }
 
   if (loading) {
@@ -146,28 +160,34 @@ export default function CampaignDetail() {
         <div className="flex flex-wrap gap-2">
           {isPendingReview && (
             <Button
-              onClick={() => updateStatus({ status: 'active', pending_review: false })}
+              onClick={() =>
+                runCampaignAction('resume_campaign', 'Agency approved launch from dashboard')
+              }
               disabled={statusBusy}
             >
-              Approve & launch
+              {statusBusy ? 'Working…' : 'Approve & launch'}
             </Button>
           )}
           {campaign.status === 'active' && (
             <Button
               variant="secondary"
-              onClick={() => updateStatus({ status: 'paused', pending_review: false })}
+              onClick={() =>
+                runCampaignAction('pause_campaign', 'Agency paused from dashboard')
+              }
               disabled={statusBusy}
             >
-              Pause campaign
+              {statusBusy ? 'Working…' : 'Pause campaign'}
             </Button>
           )}
           {campaign.status === 'paused' && !campaign.pending_review && (
             <Button
               variant="secondary"
-              onClick={() => updateStatus({ status: 'active' })}
+              onClick={() =>
+                runCampaignAction('resume_campaign', 'Agency resumed from dashboard')
+              }
               disabled={statusBusy}
             >
-              Resume campaign
+              {statusBusy ? 'Working…' : 'Resume campaign'}
             </Button>
           )}
         </div>
@@ -219,7 +239,7 @@ export default function CampaignDetail() {
 
       {/* Campaign settings summary */}
       <Card className="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 p-4 text-sm sm:grid-cols-3">
-        <Detail label="Daily budget" value={formatCents(campaign.daily_budget_cents)} />
+        <Detail label="Daily budget" value={formatMoney(campaign.daily_budget_usd)} />
         <Detail label="Bid strategy" value={campaign.bid_strategy} />
         <Detail
           label="Targeting"
@@ -248,7 +268,10 @@ export default function CampaignDetail() {
         {tab === 'recommendations' ? (
           <RecommendationsList campaignId={campaign.id} />
         ) : (
-          <CampaignChat campaignId={campaign.id} />
+          <CampaignChat
+            campaignId={campaign.id}
+            currentBudgetUsd={campaign.daily_budget_usd}
+          />
         )}
       </div>
     </DashboardLayout>

@@ -1,0 +1,181 @@
+{
+  "name": "Meta - apply-campaign-action",
+  "nodes": [
+    {
+      "parameters": { "httpMethod": "POST", "path": "meta-apply-campaign-action", "responseMode": "responseNode", "options": {} },
+      "id": "c1000000-0000-0000-0000-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 800],
+      "webhookId": "meta-apply-campaign-action",
+      "notes": "Called by CampaignChat.tsx 'Confirm & apply' AND by CampaignDetail.tsx launch/pause/resume buttons. Payload: { campaign_id, proposed_action, chat_message_id? }. chat_message_id is null when it comes from the dashboard buttons. Sync response { ok: true }."
+    },
+    {
+      "parameters": {
+        "jsCode": "const b = $json.body || {};\nconst uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;\nif (typeof b.campaign_id !== 'string' || !uuidRe.test(b.campaign_id)) {\n  throw new Error('campaign_id missing or not a valid UUID: ' + JSON.stringify(b.campaign_id));\n}\nif (!b.proposed_action || typeof b.proposed_action !== 'object' || !b.proposed_action.action_type) {\n  throw new Error('proposed_action missing or malformed: ' + JSON.stringify(b.proposed_action));\n}\nconst chatId = (typeof b.chat_message_id === 'string' && uuidRe.test(b.chat_message_id)) ? b.chat_message_id : null;\nreturn [{ json: { campaign_id: b.campaign_id, chat_message_id: chatId, proposed_action: b.proposed_action } }];\n"
+      },
+      "id": "c1000000-0000-0000-0000-000000000002",
+      "name": "Validate input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [224, 800]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "tableId": "campaigns",
+        "filters": { "conditions": [ { "keyName": "id", "keyValue": "={{ $('Validate input').item.json.campaign_id }}" } ] }
+      },
+      "id": "c1000000-0000-0000-0000-000000000003",
+      "name": "Get campaign",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [448, 800],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": { "operation": "getAll", "tableId": "meta_ads_settings", "limit": 1, "filterType": "none" },
+      "id": "c1000000-0000-0000-0000-000000000004",
+      "name": "Get Meta credentials",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [672, 800],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } },
+      "notes": "Reads the singleton row managed from the dashboard /settings page. Uses system_user_token (long-lived — no OAuth refresh step, unlike the Google Ads workflows)."
+    },
+    {
+      "parameters": {
+        "jsCode": "const campaign = $('Get campaign').item.json;\nif (!campaign || !campaign.id) throw new Error('Campaign not found.');\nconst token = $('Get Meta credentials').item.json.system_user_token;\nif (!token) throw new Error('meta_ads_settings.system_user_token is not set.');\nconst API = 'https://graph.facebook.com/v21.0';\nconst action = $('Validate input').item.json.proposed_action;\n\nconst campaignId = campaign.meta_campaign_id;\nconst adsetId = campaign.meta_adset_id;\nconst adId = campaign.meta_ad_id;\n\nconst ops = []; // { url, form: {field: value} }\nlet campaignStatusValue = campaign.status;\nlet newBudgetUsd = campaign.daily_budget_usd;\n\nif (action.action_type === 'update_daily_budget') {\n  if (typeof action.daily_budget_usd !== 'number') throw new Error('proposed_action.daily_budget_usd is missing or not a number.');\n  if (!adsetId) throw new Error('This campaign has no meta_adset_id on file — cannot set the budget (Meta budgets live on the ad set).');\n  // Meta wants the budget in the account currency MINOR unit (cents for USD).\n  ops.push({ url: API + '/' + adsetId, form: { daily_budget: String(Math.round(action.daily_budget_usd * 100)) } });\n  newBudgetUsd = action.daily_budget_usd;\n} else if (action.action_type === 'pause_campaign') {\n  if (!campaignId) throw new Error('This campaign has no meta_campaign_id on file.');\n  ops.push({ url: API + '/' + campaignId, form: { status: 'PAUSED' } });\n  campaignStatusValue = 'paused';\n} else if (action.action_type === 'resume_campaign') {\n  if (!campaignId) throw new Error('This campaign has no meta_campaign_id on file.');\n  // Activating a Meta parent does NOT cascade to children — set each level we know.\n  ops.push({ url: API + '/' + campaignId, form: { status: 'ACTIVE' } });\n  if (adsetId) ops.push({ url: API + '/' + adsetId, form: { status: 'ACTIVE' } });\n  if (adId) ops.push({ url: API + '/' + adId, form: { status: 'ACTIVE' } });\n  campaignStatusValue = 'active';\n} else {\n  throw new Error('Unknown proposed_action.action_type: ' + action.action_type);\n}\n\nreturn ops.map(op => ({ json: {\n  url: op.url,\n  form: op.form,\n  access_token: token,\n  campaignRowId: campaign.id,\n  actionType: action.action_type,\n  campaignStatusValue,\n  newBudgetUsd,\n} }));\n"
+      },
+      "id": "c1000000-0000-0000-0000-000000000005",
+      "name": "Build Meta ops",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [896, 800],
+      "notes": "One output item per Meta Graph API call. update_daily_budget -> one call to the ad set. resume_campaign -> up to 3 calls (campaign + ad set + ad), because Meta does not cascade an ACTIVE status down to children. pause_campaign -> one call to the campaign (that alone stops delivery)."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            { "name": "status", "value": "={{ $json.form.status || '' }}" },
+            { "name": "daily_budget", "value": "={{ $json.form.daily_budget || '' }}" },
+            { "name": "access_token", "value": "={{ $json.access_token }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "c1000000-0000-0000-0000-000000000006",
+      "name": "Apply on Meta",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 800],
+      "notes": "Empty status/daily_budget params are harmless — Meta ignores blank fields. Runs once per item from 'Build Meta ops'. If Meta returns an error object here (200 with { error: {...} }) the workflow still continues; check the execution output. Consider turning on 'Options > Response > Never Error' off so real HTTP errors surface."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 1 },
+          "conditions": [ { "leftValue": "={{ $('Build Meta ops').first().json.actionType }}", "rightValue": "update_daily_budget", "operator": { "type": "string", "operation": "equals" } } ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c1000000-0000-0000-0000-000000000007",
+      "name": "Is budget update?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1344, 800]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "campaigns",
+        "matchType": "allFilters",
+        "filters": { "conditions": [ { "keyName": "id", "condition": "eq", "keyValue": "={{ $('Validate input').item.json.campaign_id }}" } ] },
+        "fieldsUi": { "fieldValues": [ { "fieldId": "daily_budget_usd", "fieldValue": "={{ $('Build Meta ops').first().json.newBudgetUsd }}" } ] }
+      },
+      "id": "c1000000-0000-0000-0000-000000000008",
+      "name": "Update campaign budget",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1568, 704],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } },
+      "notes": "Writeback so the dashboard doesn't keep showing the old budget. (Same missing-writeback bug the Google Ads version hit live.)"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "campaigns",
+        "matchType": "allFilters",
+        "filters": { "conditions": [ { "keyName": "id", "condition": "eq", "keyValue": "={{ $('Validate input').item.json.campaign_id }}" } ] },
+        "fieldsUi": { "fieldValues": [ { "fieldId": "status", "fieldValue": "={{ $('Build Meta ops').first().json.campaignStatusValue }}" }, { "fieldId": "pending_review", "fieldValue": "false" } ] }
+      },
+      "id": "c1000000-0000-0000-0000-000000000009",
+      "name": "Update campaign status",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1568, 896],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } },
+      "notes": "Clears pending_review on any pause/resume — once the agency has made a launch decision, the campaign is no longer 'awaiting review'. This is what flips the violet badge off in the dashboard."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 1 },
+          "conditions": [ { "leftValue": "={{ $('Validate input').item.json.chat_message_id }}", "rightValue": "", "operator": { "type": "string", "operation": "notEmpty" } } ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c1000000-0000-0000-0000-00000000000a",
+      "name": "Has chat_message_id?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1792, 800]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "campaign_chat_messages",
+        "matchType": "allFilters",
+        "filters": { "conditions": [ { "keyName": "id", "condition": "eq", "keyValue": "={{ $('Validate input').item.json.chat_message_id }}" } ] },
+        "fieldsUi": { "fieldValues": [ { "fieldId": "action_status", "fieldValue": "applied" } ] }
+      },
+      "id": "c1000000-0000-0000-0000-00000000000b",
+      "name": "Mark chat message applied",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [2016, 704],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": { "respondWith": "json", "responseBody": "={{ JSON.stringify({ ok: true }) }}", "options": {} },
+      "id": "c1000000-0000-0000-0000-00000000000c",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2240, 800]
+    }
+  ],
+  "connections": {
+    "Webhook": { "main": [ [ { "node": "Validate input", "type": "main", "index": 0 } ] ] },
+    "Validate input": { "main": [ [ { "node": "Get campaign", "type": "main", "index": 0 } ] ] },
+    "Get campaign": { "main": [ [ { "node": "Get Meta credentials", "type": "main", "index": 0 } ] ] },
+    "Get Meta credentials": { "main": [ [ { "node": "Build Meta ops", "type": "main", "index": 0 } ] ] },
+    "Build Meta ops": { "main": [ [ { "node": "Apply on Meta", "type": "main", "index": 0 } ] ] },
+    "Apply on Meta": { "main": [ [ { "node": "Is budget update?", "type": "main", "index": 0 } ] ] },
+    "Is budget update?": { "main": [ [ { "node": "Update campaign budget", "type": "main", "index": 0 } ], [ { "node": "Update campaign status", "type": "main", "index": 0 } ] ] },
+    "Update campaign budget": { "main": [ [ { "node": "Has chat_message_id?", "type": "main", "index": 0 } ] ] },
+    "Update campaign status": { "main": [ [ { "node": "Has chat_message_id?", "type": "main", "index": 0 } ] ] },
+    "Has chat_message_id?": { "main": [ [ { "node": "Mark chat message applied", "type": "main", "index": 0 } ], [ { "node": "Respond to Webhook", "type": "main", "index": 0 } ] ] },
+    "Mark chat message applied": { "main": [ [ { "node": "Respond to Webhook", "type": "main", "index": 0 } ] ] }
+  },
+  "pinData": {},
+  "meta": {}
+}

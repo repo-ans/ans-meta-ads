@@ -1,25 +1,10 @@
-// Formatting helpers. Money is stored in cents everywhere — never render raw cents.
+// Formatting helpers. Money (daily_budget_usd, spend, dollars_recoverable, …)
+// is stored as plain dollars.
 
 const usd = new Intl.NumberFormat('en-US', {
   style: 'currency',
   currency: 'USD',
 })
-
-const usd0 = new Intl.NumberFormat('en-US', {
-  style: 'currency',
-  currency: 'USD',
-  maximumFractionDigits: 0,
-})
-
-export function formatCents(cents: number | null | undefined): string {
-  if (cents == null) return '—'
-  return usd.format(cents / 100)
-}
-
-export function formatCentsWhole(cents: number | null | undefined): string {
-  if (cents == null) return '—'
-  return usd0.format(cents / 100)
-}
 
 export function formatMoney(dollars: number | null | undefined): string {
   if (dollars == null) return '—'
@@ -83,16 +68,11 @@ export function pctChange(
   return { pct, direction }
 }
 
-// Dollars-to-cents for form input (accepts "50", "50.00", "$50").
-export function dollarsToCents(input: string): number | null {
+// Parse a currency-ish form input ("50", "50.00", "$50", "1,000") to a number.
+export function parseDollars(input: string): number | null {
   const cleaned = input.replace(/[$,\s]/g, '')
   if (cleaned === '') return null
   const n = Number(cleaned)
   if (Number.isNaN(n)) return null
-  return Math.round(n * 100)
-}
-
-export function centsToDollarsInput(cents: number | null | undefined): string {
-  if (cents == null) return ''
-  return (cents / 100).toString()
+  return Math.round(n * 100) / 100
 }

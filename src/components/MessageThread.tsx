@@ -2,9 +2,9 @@ import { useCallback, useEffect, useState } from 'react'
 import { supabase } from '../lib/supabase'
 import type { Message } from '../lib/database.types'
 import { formatDateTime } from '../lib/format'
+import { triggerSendReply, WebhookError } from '../lib/webhooks'
 import { Button, EmptyState, Pill, Spinner, TextArea, TextInput } from './ui'
 import { ProposedActionPreview } from './ProposedActionPreview'
-import type { ProposedAction } from '../lib/database.types'
 
 type Row = Message & { campaigns?: { campaign_name: string | null } | null }
 
@@ -53,7 +53,7 @@ export function MessageThread({ clientId }: { clientId: string }) {
       ) : (
         <div className="space-y-3">
           {rows.map((m) => (
-            <MessageCard key={m.id} message={m} onChanged={load} />
+            <MessageCard key={m.id} message={m} onChanged={load} onError={setError} />
           ))}
         </div>
       )}
@@ -63,24 +63,47 @@ export function MessageThread({ clientId }: { clientId: string }) {
   )
 }
 
-function MessageCard({ message: m, onChanged }: { message: Row; onChanged: () => void }) {
+function MessageCard({
+  message: m,
+  onChanged,
+  onError,
+}: {
+  message: Row
+  onChanged: () => void
+  onError: (msg: string) => void
+}) {
   const inbound = m.direction === 'inbound'
   const isDraft = m.status === 'drafted' || (m.status === 'new' && !!m.ai_draft_body)
   const [draft, setDraft] = useState(m.ai_draft_body ?? m.body ?? '')
   const [busy, setBusy] = useState(false)
-  const action = m.proposed_action as ProposedAction | null
+  const action = m.proposed_action
 
+  // Approve & send: persist the (possibly edited) draft, then let n8n's
+  // send-reply workflow apply any proposed_action on Meta, insert the outbound
+  // row, and mark this one sent.
   async function send() {
     setBusy(true)
-    await supabase
+    onError('')
+    const { error } = await supabase
       .from('messages')
-      .update({
-        body: draft,
-        direction: 'outbound',
-        status: 'sent',
-        sent_at: new Date().toISOString(),
-      })
+      .update({ ai_draft_body: draft })
       .eq('id', m.id)
+    if (error) {
+      setBusy(false)
+      onError(error.message)
+      return
+    }
+    try {
+      await triggerSendReply(m.id)
+    } catch (e) {
+      setBusy(false)
+      onError(
+        e instanceof WebhookError
+          ? `Draft saved, but the send workflow could not be reached: ${e.message}`
+          : 'Draft saved, but sending failed.',
+      )
+      return
+    }
     setBusy(false)
     onChanged()
   }
@@ -110,6 +133,10 @@ function MessageCard({ message: m, onChanged }: { message: Row; onChanged: () =>
 
       {m.subject && <p className="text-sm font-semibold text-slate-800">{m.subject}</p>}
 
+      {inbound && m.body && (
+        <p className="mt-1 whitespace-pre-wrap text-sm text-slate-700">{m.body}</p>
+      )}
+
       {isDraft ? (
         <div className="mt-2 space-y-2">
           <p className="text-xs font-medium uppercase tracking-wide text-brand-700">
@@ -117,6 +144,11 @@ function MessageCard({ message: m, onChanged }: { message: Row; onChanged: () =>
           </p>
           <TextArea rows={4} value={draft} onChange={(e) => setDraft(e.target.value)} />
           {action && <ProposedActionPreview action={action} />}
+          {action && (
+            <p className="text-xs text-slate-500">
+              Sending will also apply this change on Meta.
+            </p>
+          )}
           <div className="flex gap-2">
             <Button onClick={send} disabled={busy || !draft.trim()}>
               {busy ? 'Sending…' : 'Approve & send'}
@@ -127,7 +159,9 @@ function MessageCard({ message: m, onChanged }: { message: Row; onChanged: () =>
           </div>
         </div>
       ) : (
-        <p className="mt-1 whitespace-pre-wrap text-sm text-slate-700">{m.body}</p>
+        !inbound && (
+          <p className="mt-1 whitespace-pre-wrap text-sm text-slate-700">{m.body}</p>
+        )
       )}
     </div>
   )

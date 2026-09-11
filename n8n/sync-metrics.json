@@ -1,0 +1,466 @@
+{
+  "name": "Meta - sync-metrics",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [ { "triggerAtHour": 6 } ] } },
+      "id": "e1000000-0000-0000-0000-000000000001",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-320, 460],
+      "notes": "Daily 6:00 AM server time. Mirrors the Phase-1 Google Sheets reporting agent cadence."
+    },
+    {
+      "parameters": { "httpMethod": "POST", "path": "meta-sync-now", "options": {} },
+      "id": "e1000000-0000-0000-0000-000000000002",
+      "name": "Sync Now Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-320, 620],
+      "webhookId": "meta-sync-now",
+      "notes": "Called by the dashboard 'Sync Now' button (DashboardLayout.tsx -> triggerSyncNow). Responds immediately (onReceived); the dashboard reloads its data a few seconds later, best-effort."
+    },
+    {
+      "parameters": { "operation": "getAll", "tableId": "meta_ads_settings", "limit": 1, "filterType": "none" },
+      "id": "e1000000-0000-0000-0000-000000000003",
+      "name": "Get Meta credentials",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [-80, 540],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": { "operation": "getAll", "tableId": "campaigns", "returnAll": true, "filterType": "none" },
+      "id": "e1000000-0000-0000-0000-000000000004",
+      "name": "Get all campaigns",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [160, 540],
+      "alwaysOutputData": true,
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } },
+      "notes": "alwaysOutputData: an empty campaigns table must not halt the whole workflow (incl. the discovery branch). Downstream nodes skip rows with no meta_campaign_id."
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(i => i.json);\nconst token = $('Get Meta credentials').first().json.system_user_token;\nconst out = [];\nfor (const row of rows) {\n  if (!row.meta_campaign_id) continue;\n  out.push({ json: {\n    campaignRowId: row.id,\n    metaCampaignId: row.meta_campaign_id,\n    metaAdsetId: row.meta_adset_id || null,\n    campaignName: row.campaign_name,\n    status: row.status,\n    objective: row.objective,\n    dailyBudgetUsd: row.daily_budget_usd,\n    accessToken: token,\n  } });\n}\nreturn out;\n"
+      },
+      "id": "e1000000-0000-0000-0000-000000000005",
+      "name": "Filter synced campaigns",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [400, 400],
+      "notes": "One item per campaign that has actually been built on Meta (meta_campaign_id set). The rest of the metric/recommendation/config chain processes each independently."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v21.0/{{ $json.metaCampaignId }}/insights",
+        "sendQuery": true,
+        "queryParameters": { "parameters": [
+          { "name": "fields", "value": "spend,impressions,clicks,cpm,cpc,ctr,frequency,actions,cost_per_action_type,purchase_roas" },
+          { "name": "date_preset", "value": "yesterday" },
+          { "name": "access_token", "value": "={{ $json.accessToken }}" }
+        ] },
+        "options": {}
+      },
+      "id": "e1000000-0000-0000-0000-000000000006",
+      "name": "Fetch insights",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 300],
+      "notes": "Meta returns { data: [] } for a campaign with no spend yesterday — that is normal, not an error. 'Build metrics row' falls back to a zero row so daily history stays gap-free."
+    },
+    {
+      "parameters": {
+        "jsCode": "const campaigns = $('Filter synced campaigns').all();\nconst searches = $('Fetch insights').all();\nconst fallbackDate = new Date(Date.now() - 86400000).toISOString().slice(0, 10);\n\n// action_type values that count as a 'result', in priority order. Meta varies\n// by account/objective — mirror the Phase-1 reporting agent's lead matching.\nconst RESULT_TYPES = ['lead','onsite_conversion.lead_grouped','offsite_conversion.fdt_lead','leadgen.other','onsite_web_lead','offsite_conversion.fdt_purchase','purchase','omni_purchase','link_click'];\n\nfunction pickResults(actions) {\n  if (!Array.isArray(actions)) return 0;\n  for (const t of RESULT_TYPES) {\n    const hit = actions.find(a => a.action_type === t);\n    if (hit) return Number(hit.value || 0);\n  }\n  return 0;\n}\n\nreturn campaigns.map((c, i) => {\n  const data = (searches[i] && searches[i].json.data) || [];\n  const row = data[0];\n  const spend = row ? Number(row.spend || 0) : 0;\n  const results = row ? pickResults(row.actions) : 0;\n  const roasArr = row && Array.isArray(row.purchase_roas) ? row.purchase_roas : [];\n  const roas = roasArr.length ? Number(roasArr[0].value || 0) : null;\n  return { json: {\n    campaign_id: c.json.campaignRowId,\n    date: row ? (row.date_start || fallbackDate) : fallbackDate,\n    spend,\n    results,\n    cost_per_result: results > 0 ? spend / results : null,\n    impressions: row ? Number(row.impressions || 0) : 0,\n    clicks: row ? Number(row.clicks || 0) : 0,\n    cpm: row ? Number(row.cpm || 0) : 0,\n    cpc: row ? Number(row.cpc || 0) : 0,\n    ctr: row ? Number(row.ctr || 0) : 0,\n    frequency: row ? Number(row.frequency || 0) : 0,\n    roas,\n  } };\n});\n"
+      },
+      "id": "e1000000-0000-0000-0000-000000000007",
+      "name": "Build metrics row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 300]
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "tableId": "campaign_metrics",
+        "matchType": "allFilters",
+        "filters": { "conditions": [ { "keyName": "campaign_id", "condition": "eq", "keyValue": "={{ $json.campaign_id }}" }, { "keyName": "date", "condition": "eq", "keyValue": "={{ $json.date }}" } ] }
+      },
+      "id": "e1000000-0000-0000-0000-000000000008",
+      "name": "Delete existing metrics row",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1120, 300],
+      "alwaysOutputData": true,
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } },
+      "notes": "Delete-then-insert = idempotent re-runs (unique(campaign_id,date)). alwaysOutputData: zero rows deleted (normal first run) must not halt the branch."
+    },
+    {
+      "parameters": {
+        "tableId": "campaign_metrics",
+        "fieldsUi": { "fieldValues": [
+          { "fieldId": "campaign_id", "fieldValue": "={{ $('Build metrics row').all()[$itemIndex].json.campaign_id }}" },
+          { "fieldId": "date", "fieldValue": "={{ $('Build metrics row').all()[$itemIndex].json.date }}" },
+          { "fieldId": "spend", "fieldValue": "={{ $('Build metrics row').all()[$itemIndex].json.spend }}" },
+          { "fieldId": "results", "fieldValue": "={{ $('Build metrics row').all()[$itemIndex].json.results }}" },
+          { "fieldId": "cost_per_result", "fieldValue": "={{ $('Build metrics row').all()[$itemIndex].json.cost_per_result }}" },
+          { "fieldId": "impressions", "fieldValue": "={{ $('Build metrics row').all()[$itemIndex].json.impressions }}" },
+          { "fieldId": "clicks", "fieldValue": "={{ $('Build metrics row').all()[$itemIndex].json.clicks }}" },
+          { "fieldId": "cpm", "fieldValue": "={{ $('Build metrics row').all()[$itemIndex].json.cpm }}" },
+          { "fieldId": "cpc", "fieldValue": "={{ $('Build metrics row').all()[$itemIndex].json.cpc }}" },
+          { "fieldId": "ctr", "fieldValue": "={{ $('Build metrics row').all()[$itemIndex].json.ctr }}" },
+          { "fieldId": "frequency", "fieldValue": "={{ $('Build metrics row').all()[$itemIndex].json.frequency }}" },
+          { "fieldId": "roas", "fieldValue": "={{ $('Build metrics row').all()[$itemIndex].json.roas }}" }
+        ] }
+      },
+      "id": "e1000000-0000-0000-0000-000000000009",
+      "name": "Create metrics row",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1360, 300],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v21.0/{{ $('Filter synced campaigns').item.json.metaCampaignId }}",
+        "sendQuery": true,
+        "queryParameters": { "parameters": [
+          { "name": "fields", "value": "recommendations" },
+          { "name": "access_token", "value": "={{ $('Filter synced campaigns').item.json.accessToken }}" }
+        ] },
+        "options": {}
+      },
+      "id": "e1000000-0000-0000-0000-00000000000a",
+      "name": "Fetch recommendations",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 500],
+      "notes": "Meta's `recommendations` edge is thin compared to Google's — it returns { recommendations: [{ code, title, message, confidence, importance, blame_field }] } when present and omits the field entirely otherwise. No dollar impact is provided, so dollars_recoverable is left null. If your app/token can't read this field it just comes back empty; that's fine."
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "tableId": "recommendations",
+        "matchType": "allFilters",
+        "filters": { "conditions": [ { "keyName": "campaign_id", "condition": "eq", "keyValue": "={{ $('Filter synced campaigns').item.json.campaignRowId }}" }, { "keyName": "status", "condition": "eq", "keyValue": "open" } ] }
+      },
+      "id": "e1000000-0000-0000-0000-00000000000b",
+      "name": "Delete existing open recommendations",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [880, 500],
+      "alwaysOutputData": true,
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } },
+      "notes": "Clears previously-open recs so ones Meta no longer surfaces stop showing. Does NOT touch applied/dismissed rows."
+    },
+    {
+      "parameters": {
+        "jsCode": "const campaigns = $('Filter synced campaigns').all();\nconst searches = $('Fetch recommendations').all();\nconst out = [];\ncampaigns.forEach((c, i) => {\n  const campaignRowId = c.json.campaignRowId;\n  const metaCampaignId = c.json.metaCampaignId;\n  const recs = (searches[i] && searches[i].json && searches[i].json.recommendations) || [];\n  for (const r of recs) {\n    out.push({ json: {\n      campaign_id: campaignRowId,\n      type: r.code || r.title || 'recommendation',\n      dollars_recoverable: null,\n      resource_name: metaCampaignId + ':' + (r.code || r.title || Math.random().toString(36).slice(2)),\n      status: 'open',\n    } });\n  }\n});\nreturn out;\n"
+      },
+      "id": "e1000000-0000-0000-0000-00000000000c",
+      "name": "Build recommendation items",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 500]
+    },
+    {
+      "parameters": {
+        "tableId": "recommendations",
+        "fieldsUi": { "fieldValues": [
+          { "fieldId": "campaign_id", "fieldValue": "={{ $json.campaign_id }}" },
+          { "fieldId": "type", "fieldValue": "={{ $json.type }}" },
+          { "fieldId": "dollars_recoverable", "fieldValue": "={{ $json.dollars_recoverable }}" },
+          { "fieldId": "resource_name", "fieldValue": "={{ $json.resource_name }}" },
+          { "fieldId": "status", "fieldValue": "open" }
+        ] }
+      },
+      "id": "e1000000-0000-0000-0000-00000000000d",
+      "name": "Create recommendation row",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1360, 500],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v21.0/{{ $('Filter synced campaigns').item.json.metaCampaignId }}",
+        "sendQuery": true,
+        "queryParameters": { "parameters": [
+          { "name": "fields", "value": "status,effective_status,daily_budget" },
+          { "name": "access_token", "value": "={{ $('Filter synced campaigns').item.json.accessToken }}" }
+        ] },
+        "options": {}
+      },
+      "id": "e1000000-0000-0000-0000-00000000000e",
+      "name": "Fetch campaign config",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 700],
+      "notes": "campaign.daily_budget is only set for Campaign Budget Optimization (CBO) campaigns; otherwise budget lives on the ad set. 'Reconcile config' also fetches the ad set budget when meta_adset_id is present."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v21.0/{{ $('Filter synced campaigns').item.json.metaAdsetId || $('Filter synced campaigns').item.json.metaCampaignId }}",
+        "sendQuery": true,
+        "queryParameters": { "parameters": [
+          { "name": "fields", "value": "daily_budget" },
+          { "name": "access_token", "value": "={{ $('Filter synced campaigns').item.json.accessToken }}" }
+        ] },
+        "options": {}
+      },
+      "id": "e1000000-0000-0000-0000-00000000000f",
+      "name": "Fetch adset budget",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 700],
+      "notes": "Falls back to querying the campaign id when there's no meta_adset_id (harmless — just returns the campaign's daily_budget or nothing)."
+    },
+    {
+      "parameters": {
+        "jsCode": "const campaigns = $('Filter synced campaigns').all();\nconst configs = $('Fetch campaign config').all();\nconst budgets = $('Fetch adset budget').all();\nconst statusMap = { ACTIVE: 'active', PAUSED: 'paused' };\nconst out = [];\ncampaigns.forEach((c, i) => {\n  const cfg = (configs[i] && configs[i].json) || {};\n  const bud = (budgets[i] && budgets[i].json) || {};\n  if (!cfg.status && !cfg.effective_status) return; // campaign gone / no data\n  const raw = cfg.effective_status && ['CAMPAIGN_PAUSED','PAUSED','ADSET_PAUSED'].includes(cfg.effective_status) ? 'PAUSED' : cfg.status;\n  const minor = Number(bud.daily_budget || cfg.daily_budget || 0);\n  out.push({ json: {\n    campaignRowId: c.json.campaignRowId,\n    status: statusMap[raw] || 'paused',\n    dailyBudgetUsd: minor > 0 ? minor / 100 : c.json.dailyBudgetUsd,\n  } });\n});\nreturn out;\n"
+      },
+      "id": "e1000000-0000-0000-0000-000000000010",
+      "name": "Reconcile config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 700],
+      "notes": "Reconciles campaigns.status + daily_budget_usd to whatever Meta actually reports — catches changes made directly in Ads Manager. Does NOT touch pending_review (a build-time / launch-decision concept, not something Meta knows about)."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "campaigns",
+        "matchType": "allFilters",
+        "filters": { "conditions": [ { "keyName": "id", "condition": "eq", "keyValue": "={{ $json.campaignRowId }}" } ] },
+        "fieldsUi": { "fieldValues": [ { "fieldId": "status", "fieldValue": "={{ $json.status }}" }, { "fieldId": "daily_budget_usd", "fieldValue": "={{ $json.dailyBudgetUsd }}" } ] }
+      },
+      "id": "e1000000-0000-0000-0000-000000000011",
+      "name": "Update campaign config",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1360, 700],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const campaigns = $('Filter synced campaigns').all();\nconst metricsRows = $('Build metrics row').all();\nconst allRecs = $('Build recommendation items').all().map(i => i.json).filter(r => r && r.campaign_id);\nreturn campaigns.map((c, i) => {\n  const m = (metricsRows[i] && metricsRows[i].json) || {};\n  const recRows = allRecs.filter(r => r.campaign_id === c.json.campaignRowId);\n  const roas = m.roas != null ? m.roas : null;\n  const recsText = recRows.length ? recRows.map(r => '- ' + r.type).join('\\n') : 'None currently open.';\n  return { json: {\n    campaignRowId: c.json.campaignRowId,\n    campaignName: c.json.campaignName,\n    status: c.json.status,\n    objective: c.json.objective,\n    dailyBudgetUsd: c.json.dailyBudgetUsd,\n    date: m.date,\n    spend: m.spend,\n    results: m.results,\n    costPerResult: m.cost_per_result,\n    roas,\n    recommendationsText: recsText,\n  } };\n});\n"
+      },
+      "id": "e1000000-0000-0000-0000-000000000012",
+      "name": "Build suggestion context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1600, 300]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Campaign: {{ $json.campaignName }} (status: {{ $json.status }}, objective {{ $json.objective }}, daily budget ${{ $json.dailyBudgetUsd }}).\nYesterday ({{ $json.date }}): spend ${{ $json.spend }}, results {{ $json.results }}, cost per result {{ $json.costPerResult || 'n/a' }}, ROAS {{ $json.roas || 'n/a' }}.\n\nOpen Meta recommendations:\n{{ $json.recommendationsText }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are reviewing this Meta (Facebook/Instagram) Ads campaign's daily performance sync automatically, on behalf of an agency, with no human having asked a question. Decide whether there's a genuinely useful, specific, non-obvious suggestion worth surfacing right now — a clear problem (real spend with zero results, runaway cost per result, obvious frequency/fatigue issue) or a binding budget. Be conservative: should_post = false unless something actually stands out. A missed suggestion beats noise the agency learns to ignore.\n\nWhen should_post is true, proposed_action follows the same rules as everywhere in this project: null UNLESS you're suggesting exactly one of update_daily_budget (daily_budget_usd required, a specific number), pause_campaign, or resume_campaign, with a one-sentence reason. Most posts have proposed_action: null."
+        }
+      },
+      "id": "e1000000-0000-0000-0000-000000000013",
+      "name": "Suggest (AI Agent)",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [1840, 300]
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"should_post\": { \"type\": \"boolean\" },\n    \"message\": { \"type\": \"string\" },\n    \"proposed_action\": {\n      \"type\": [\"object\", \"null\"],\n      \"properties\": {\n        \"action_type\": { \"type\": \"string\", \"enum\": [\"update_daily_budget\", \"pause_campaign\", \"resume_campaign\"] },\n        \"daily_budget_usd\": { \"type\": [\"number\", \"null\"] },\n        \"reason\": { \"type\": \"string\" }\n      },\n      \"required\": [\"action_type\", \"daily_budget_usd\", \"reason\"]\n    }\n  },\n  \"required\": [\"should_post\", \"message\", \"proposed_action\"]\n}"
+      },
+      "id": "e1000000-0000-0000-0000-000000000014",
+      "name": "Structured Output Parser",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [2000, 500]
+    },
+    {
+      "parameters": {
+        "model": { "__rl": true, "mode": "list", "value": "gpt-5-mini" },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [1840, 500],
+      "id": "e1000000-0000-0000-0000-000000000015",
+      "name": "OpenAI Chat Model",
+      "credentials": { "openAiApi": { "id": "fj3WhBV98VkK9qr3", "name": "Manam- OpenAi account" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const aiOutputs = $input.all();\nconst contexts = $('Build suggestion context').all();\nreturn aiOutputs.map((item, i) => {\n  const output = item.json.output || {};\n  return { json: {\n    campaignRowId: (contexts[i] && contexts[i].json.campaignRowId) || null,\n    shouldPost: !!output.should_post,\n    message: output.message,\n    proposedAction: output.proposed_action || null,\n    actionStatus: output.proposed_action ? 'proposed' : null,\n  } };\n});\n"
+      },
+      "id": "e1000000-0000-0000-0000-000000000016",
+      "name": "Prepare suggestion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2160, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 1 },
+          "conditions": [ { "leftValue": "={{ $json.shouldPost }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } } ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e1000000-0000-0000-0000-000000000017",
+      "name": "Should post?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2380, 300]
+    },
+    {
+      "parameters": {
+        "tableId": "campaign_chat_messages",
+        "fieldsUi": { "fieldValues": [
+          { "fieldId": "campaign_id", "fieldValue": "={{ $json.campaignRowId }}" },
+          { "fieldId": "role", "fieldValue": "assistant" },
+          { "fieldId": "content", "fieldValue": "={{ $json.message }}" },
+          { "fieldId": "proposed_action", "fieldValue": "={{ $json.proposedAction }}" },
+          { "fieldId": "action_status", "fieldValue": "={{ $json.actionStatus }}" }
+        ] }
+      },
+      "id": "e1000000-0000-0000-0000-000000000018",
+      "name": "Insert proactive suggestion",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [2600, 220],
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } },
+      "notes": "Posts into the same campaign_chat_messages table the Campaign Assistant tab reads — shows up like an unprompted assistant message. Confirm & Apply / Dismiss work identically."
+    },
+
+    {
+      "parameters": { "operation": "getAll", "tableId": "clients", "returnAll": true, "filterType": "none" },
+      "id": "e1000000-0000-0000-0000-000000000020",
+      "name": "Get all clients",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [400, 900],
+      "alwaysOutputData": true,
+      "executeOnce": true,
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v21.0/{{ $('Get Meta credentials').first().json.business_manager_id }}/owned_ad_accounts",
+        "sendQuery": true,
+        "queryParameters": { "parameters": [
+          { "name": "fields", "value": "id,account_id,name,account_status" },
+          { "name": "limit", "value": "200" },
+          { "name": "access_token", "value": "={{ $('Get Meta credentials').first().json.system_user_token }}" }
+        ] },
+        "options": {}
+      },
+      "id": "e1000000-0000-0000-0000-000000000021",
+      "name": "Get owned ad accounts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 900],
+      "notes": "Lists real ad accounts under the Business Manager. Add client_ad_accounts too if you also manage accounts owned by clients' own businesses and shared to yours (GET /{bm}/client_ad_accounts)."
+    },
+    {
+      "parameters": {
+        "jsCode": "const clients = $('Get all clients').all().map(i => i.json).filter(c => c && c.id);\nconst campaigns = $('Get all campaigns').all().map(i => i.json).filter(c => c && c.id);\nconst tracked = new Set(campaigns.map(c => String(c.meta_ad_account_id || '').replace(/^act_/, '')));\n\n// Map an account_id -> the single client that owns it, matched on\n// clients.meta_ad_account_id. Skip accounts no client claims and accounts with\n// no client (can't attribute a discovered campaign safely).\nconst clientByAcct = new Map();\nfor (const cl of clients) {\n  const acct = String(cl.meta_ad_account_id || '').replace(/^act_/, '');\n  if (!acct) continue;\n  if (clientByAcct.has(acct)) { clientByAcct.set(acct, null); continue; } // ambiguous\n  clientByAcct.set(acct, cl.id);\n}\n\nconst accts = ($json.data || []);\nconst out = [];\nfor (const a of accts) {\n  const acctId = String(a.account_id || a.id || '').replace(/^act_/, '');\n  if (!acctId) continue;\n  const clientId = clientByAcct.get(acctId);\n  if (!clientId) continue; // no client, or ambiguous -> skip discovery\n  out.push({ json: {\n    adAccountId: 'act_' + acctId,\n    clientId,\n    accessToken: $('Get Meta credentials').first().json.system_user_token,\n    alreadyTracked: tracked.has(acctId),\n  } });\n}\nreturn out;\n"
+      },
+      "id": "e1000000-0000-0000-0000-000000000022",
+      "name": "Resolve accounts to clients",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 900],
+      "notes": "One item per ad account that maps to exactly one client (clients.meta_ad_account_id). Ambiguous or unclaimed accounts are skipped rather than guessed — the same failure mode the Google Ads sibling hit live."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v21.0/{{ $json.adAccountId }}/campaigns",
+        "sendQuery": true,
+        "queryParameters": { "parameters": [
+          { "name": "fields", "value": "id,name,status,effective_status,objective,daily_budget" },
+          { "name": "limit", "value": "500" },
+          { "name": "access_token", "value": "={{ $json.accessToken }}" }
+        ] },
+        "options": {}
+      },
+      "id": "e1000000-0000-0000-0000-000000000023",
+      "name": "Discover campaigns",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 900]
+    },
+    {
+      "parameters": {
+        "jsCode": "const accounts = $('Resolve accounts to clients').all();\nconst searches = $input.all();\nconst known = new Set($('Get all campaigns').all().map(i => i.json).map(c => c && c.meta_campaign_id).filter(Boolean).map(String));\nconst statusMap = { ACTIVE: 'active', PAUSED: 'paused' };\nconst out = [];\nsearches.forEach((s, i) => {\n  const acct = accounts[i] && accounts[i].json;\n  if (!acct) return;\n  const rows = (s.json && s.json.data) || [];\n  for (const r of rows) {\n    if (!r.id || known.has(String(r.id))) continue;\n    const minor = Number(r.daily_budget || 0);\n    out.push({ json: {\n      clientId: acct.clientId,\n      adAccountId: acct.adAccountId,\n      campaignName: r.name,\n      status: statusMap[r.status] || 'paused',\n      objective: r.objective || 'OUTCOME_LEADS',\n      dailyBudgetUsd: minor > 0 ? minor / 100 : null,\n      metaCampaignId: String(r.id),\n    } });\n  }\n});\nreturn out;\n"
+      },
+      "id": "e1000000-0000-0000-0000-000000000024",
+      "name": "Filter new campaigns",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1360, 900],
+      "notes": "Index-matches each account's campaign list back to its client. primary_goal / business_objective are left null — those are intake concepts that don't apply to a campaign discovered rather than built here (schema allows null)."
+    },
+    {
+      "parameters": {
+        "tableId": "campaigns",
+        "fieldsUi": { "fieldValues": [
+          { "fieldId": "client_id", "fieldValue": "={{ $json.clientId }}" },
+          { "fieldId": "meta_ad_account_id", "fieldValue": "={{ $json.adAccountId }}" },
+          { "fieldId": "campaign_name", "fieldValue": "={{ $json.campaignName }}" },
+          { "fieldId": "objective", "fieldValue": "={{ $json.objective }}" },
+          { "fieldId": "daily_budget_usd", "fieldValue": "={{ $json.dailyBudgetUsd }}" },
+          { "fieldId": "status", "fieldValue": "={{ $json.status }}" },
+          { "fieldId": "pending_review", "fieldValue": "false" },
+          { "fieldId": "meta_campaign_id", "fieldValue": "={{ $json.metaCampaignId }}" }
+        ] }
+      },
+      "id": "e1000000-0000-0000-0000-000000000025",
+      "name": "Insert discovered campaign",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1600, 900],
+      "continueOnFail": true,
+      "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } },
+      "notes": "pending_review=false — a campaign that already existed on Meta was never 'awaiting the agency's launch decision'. continueOnFail: a unique(meta_campaign_id) conflict from a race just skips that one row."
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": { "main": [ [ { "node": "Get Meta credentials", "type": "main", "index": 0 } ] ] },
+    "Sync Now Webhook": { "main": [ [ { "node": "Get Meta credentials", "type": "main", "index": 0 } ] ] },
+    "Get Meta credentials": { "main": [ [ { "node": "Get all campaigns", "type": "main", "index": 0 } ] ] },
+    "Get all campaigns": { "main": [ [ { "node": "Filter synced campaigns", "type": "main", "index": 0 }, { "node": "Get all clients", "type": "main", "index": 0 } ] ] },
+    "Filter synced campaigns": { "main": [ [ { "node": "Fetch insights", "type": "main", "index": 0 }, { "node": "Fetch recommendations", "type": "main", "index": 0 }, { "node": "Fetch campaign config", "type": "main", "index": 0 } ] ] },
+    "Fetch insights": { "main": [ [ { "node": "Build metrics row", "type": "main", "index": 0 } ] ] },
+    "Build metrics row": { "main": [ [ { "node": "Delete existing metrics row", "type": "main", "index": 0 } ] ] },
+    "Delete existing metrics row": { "main": [ [ { "node": "Create metrics row", "type": "main", "index": 0 } ] ] },
+    "Create metrics row": { "main": [ [ { "node": "Build suggestion context", "type": "main", "index": 0 } ] ] },
+    "Fetch recommendations": { "main": [ [ { "node": "Delete existing open recommendations", "type": "main", "index": 0 } ] ] },
+    "Delete existing open recommendations": { "main": [ [ { "node": "Build recommendation items", "type": "main", "index": 0 } ] ] },
+    "Build recommendation items": { "main": [ [ { "node": "Create recommendation row", "type": "main", "index": 0 } ] ] },
+    "Fetch campaign config": { "main": [ [ { "node": "Fetch adset budget", "type": "main", "index": 0 } ] ] },
+    "Fetch adset budget": { "main": [ [ { "node": "Reconcile config", "type": "main", "index": 0 } ] ] },
+    "Reconcile config": { "main": [ [ { "node": "Update campaign config", "type": "main", "index": 0 } ] ] },
+    "Build suggestion context": { "main": [ [ { "node": "Suggest (AI Agent)", "type": "main", "index": 0 } ] ] },
+    "Suggest (AI Agent)": { "main": [ [ { "node": "Prepare suggestion", "type": "main", "index": 0 } ] ] },
+    "Structured Output Parser": { "ai_outputParser": [ [ { "node": "Suggest (AI Agent)", "type": "ai_outputParser", "index": 0 } ] ] },
+    "OpenAI Chat Model": { "ai_languageModel": [ [ { "node": "Suggest (AI Agent)", "type": "ai_languageModel", "index": 0 } ] ] },
+    "Prepare suggestion": { "main": [ [ { "node": "Should post?", "type": "main", "index": 0 } ] ] },
+    "Should post?": { "main": [ [ { "node": "Insert proactive suggestion", "type": "main", "index": 0 } ], [] ] },
+    "Get all clients": { "main": [ [ { "node": "Get owned ad accounts", "type": "main", "index": 0 } ] ] },
+    "Get owned ad accounts": { "main": [ [ { "node": "Resolve accounts to clients", "type": "main", "index": 0 } ] ] },
+    "Resolve accounts to clients": { "main": [ [ { "node": "Discover campaigns", "type": "main", "index": 0 } ] ] },
+    "Discover campaigns": { "main": [ [ { "node": "Filter new campaigns", "type": "main", "index": 0 } ] ] },
+    "Filter new campaigns": { "main": [ [ { "node": "Insert discovered campaign", "type": "main", "index": 0 } ] ] }
+  },
+  "pinData": {},
+  "meta": {}
+}

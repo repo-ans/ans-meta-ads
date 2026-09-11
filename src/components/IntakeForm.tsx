@@ -1,7 +1,8 @@
 import { useState, type FormEvent } from 'react'
 import { supabase } from '../lib/supabase'
 import type { Client, MetaObjective } from '../lib/database.types'
-import { dollarsToCents } from '../lib/format'
+import { parseDollars } from '../lib/format'
+import { triggerBuildCampaign, WebhookError } from '../lib/webhooks'
 import { Button, Field, Select, TextArea, TextInput } from './ui'
 
 const OBJECTIVES: MetaObjective[] = [
@@ -96,36 +97,57 @@ export function IntakeForm({
       .split(',')
       .map((c) => c.trim().toUpperCase())
       .filter(Boolean)
-    const { error } = await supabase.from('campaigns').insert({
-      client_id: existingClient.id,
-      meta_ad_account_id: existingClient.meta_ad_account_id,
-      campaign_name: campaignName.trim(),
-      primary_goal: primaryGoal.trim() || null,
-      business_objective: businessObjective.trim() || null,
-      objective,
-      daily_budget_cents: dollarsToCents(dailyBudget),
-      targeting_countries: countryList.length ? countryList : null,
-      targeting_age_min: ageMin ? Number(ageMin) : null,
-      targeting_age_max: ageMax ? Number(ageMax) : null,
-      status: 'pending',
-      pending_review: true,
-    })
+    const { data, error } = await supabase
+      .from('campaigns')
+      .insert({
+        client_id: existingClient.id,
+        meta_ad_account_id: existingClient.meta_ad_account_id,
+        campaign_name: campaignName.trim(),
+        primary_goal: primaryGoal.trim() || null,
+        business_objective: businessObjective.trim() || null,
+        objective,
+        daily_budget_usd: parseDollars(dailyBudget),
+        targeting_countries: countryList.length ? countryList : null,
+        targeting_age_min: ageMin ? Number(ageMin) : null,
+        targeting_age_max: ageMax ? Number(ageMax) : null,
+        status: 'pending',
+        pending_review: true,
+      })
+      .select()
+      .single()
+
+    if (error) {
+      setSubmitting(false)
+      const r: Result = { ok: false, message: error.message }
+      setResult(r)
+      onDone?.(r)
+      return
+    }
+
+    // Kick off the n8n build (creates the campaign on Meta, PAUSED).
+    let buildNote = ''
+    try {
+      await triggerBuildCampaign((data as { id: string }).id)
+    } catch (e) {
+      buildNote =
+        e instanceof WebhookError
+          ? ` (couldn't start the automated build: ${e.message} — trigger build-campaign manually)`
+          : ''
+    }
+
     setSubmitting(false)
-    const r: Result = error
-      ? { ok: false, message: error.message }
-      : {
-          ok: true,
-          message:
-            'Campaign queued. It will be built on Meta and launched paused for your review.',
-        }
+    const r: Result = {
+      ok: true,
+      message:
+        'Campaign queued. It is being built on Meta and will land paused for your review.' +
+        buildNote,
+    }
     setResult(r)
     onDone?.(r)
-    if (r.ok) {
-      setCampaignName('')
-      setPrimaryGoal('')
-      setBusinessObjective('')
-      setDailyBudget('')
-    }
+    setCampaignName('')
+    setPrimaryGoal('')
+    setBusinessObjective('')
+    setDailyBudget('')
   }
 
   return (

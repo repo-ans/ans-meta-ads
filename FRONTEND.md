@@ -1,50 +1,57 @@
 # Agency Platform Frontend
 
-React + Vite + TypeScript + Tailwind + Supabase JS. This is the surface for
-both phases of the Meta Ads agency automation platform. It talks **only** to
-Supabase — never to Meta's API directly. All Meta work happens in n8n.
+React + Vite + TypeScript + Tailwind + Supabase JS. The surface for both phases
+of the Meta Ads agency automation platform. It talks to **Supabase** (data) and
+to the **n8n webhooks** (to trigger Meta-side actions) — never to Meta's API
+directly.
+
+This system shares its conventions with the Google Ads sibling platform: same
+`proposed_action` shape, same webhook contract style, `daily_budget_usd` in
+plain dollars.
 
 ## Setup
 
 ```bash
 npm install
-cp .env.example .env.local     # fill in VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY
+cp .env.example .env.local     # fill in the 3 VITE_ vars
 npm run dev
 ```
 
-Anon (publishable) key only. The `service_role` key must never appear in
-frontend code or `.env.local` — RLS is the security boundary.
+- `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` — anon/publishable key only.
+  The `service_role` key must never appear client-side; RLS is the boundary.
+- `VITE_N8N_WEBHOOK_BASE` — e.g. `https://n8n.srv1300653.hstgr.cloud/webhook`
+  (no trailing slash). If unset, automation triggers are skipped with a visible
+  notice; the app still runs read-only.
 
 ## Database
 
-Schema lives in [`supabase/migrations/0001_init.sql`](supabase/migrations/0001_init.sql).
-Apply it with `supabase db push` (CLI, project linked) or by pasting it into the
-Supabase SQL editor.
+- [`supabase/migrations/0001_init.sql`](supabase/migrations/0001_init.sql) — full
+  schema for a fresh setup.
+- [`supabase/migrations/0002_realign_to_platform_conventions.sql`](supabase/migrations/0002_realign_to_platform_conventions.sql)
+  — apply **after** 0001 on a DB that was already created from the first version
+  of 0001 (`daily_budget_cents→daily_budget_usd`, `meta_resource_id→resource_name`,
+  drops `sync_requests`).
 
-It creates: `clients`, `campaigns`, `campaign_metrics`, `recommendations`,
-`alerts`, `messages`, `campaign_chat_messages`, `meta_ads_settings`, RLS
-policies, and the three client-portal RPCs
-(`get_client_portal_data`, `get_client_campaigns`, `insert_client_message`).
+Tables: `clients`, `campaigns`, `campaign_metrics`, `recommendations`, `alerts`,
+`messages`, `campaign_chat_messages`, `meta_ads_settings`, RLS policies, and the
+three portal RPCs (`get_client_portal_data`, `get_client_campaigns`,
+`insert_client_message`).
 
-### Deviations from the spec — confirm these are OK
+### One deliberate addition beyond the original spec
 
-1. **`campaigns.pending_review boolean`** (default `true`) — added because the
-   spec requires the UI to distinguish "paused, awaiting the agency's launch
-   decision" from "paused, agency chose to pause it", and the given schema has
-   no field for it. n8n should set `pending_review = true` when it creates a
-   campaign (always PAUSED), and the agency clears it via **Approve & launch**.
-2. **`sync_requests` table** — the dashboard "Sync Now" button inserts a row
-   here for an n8n trigger to poll. If n8n prefers a webhook, drop the table;
-   the button degrades to a friendly "not set up" notice on its own.
+**`campaigns.pending_review boolean`** (default `true`) — the spec requires the
+UI to tell "paused, awaiting the agency's launch decision" apart from "paused,
+agency chose to pause it", and the given schema had no field for it. The
+`meta-build-campaign` workflow sets it `true`; `meta-apply-campaign-action`
+clears it on any pause/resume (i.e. once the agency has made a launch decision).
 
-Everything else matches the spec's column list exactly. `database.types.ts` is
-hand-written to match — regenerate with `supabase gen types typescript` once the
-project is linked if you prefer generated types.
+`database.types.ts` is hand-written to match; regenerate with
+`supabase gen types typescript` if you prefer generated types.
 
 ### Creating the single agency admin
 
-There is no sign-up UI. Create the one admin user in the Supabase dashboard
-(Authentication → Users → Add user), or:
+No sign-up UI. Create the one admin user in the Supabase dashboard
+(Authentication → Users → Add user) or:
 
 ```bash
 supabase auth admin create-user --email you@agency.com --password '...'
@@ -59,43 +66,62 @@ Any authenticated user has full read/write via RLS — keep it to one account.
 | `/login` | public | Supabase Auth, single admin |
 | `/intake` | public | New-client intake (client fields only) |
 | `/client/:clientId` | magic link (client UUID) | Read/reply portal, plain language |
-| `/dashboard` | admin | Client list w/ 7-day spend / CPR / ROAS |
+| `/dashboard` | admin | Client list w/ 7-day spend / cost-per-result / ROAS |
 | `/dashboard/clients/:clientId` | admin | Campaigns table, portal link, edit client, add campaign |
 | `/dashboard/clients/:clientId/campaigns/:campaignId` | admin | Stat cards, alerts, Recommendations + Assistant tabs |
 | `/dashboard/clients/:clientId/messages` | admin | Agency view of the message thread |
-| `/account`, `/settings` | admin | Password; Meta app credentials singleton |
+| `/account`, `/settings` | admin | Password; `meta_ads_settings` singleton |
 
-## What the frontend does NOT do
+## n8n webhook contract (`src/lib/webhooks.ts`)
 
-- No Meta Marketing API calls. No n8n workflows. No edge functions.
-- The Campaign Assistant (`campaign_chat_messages`) and AI message drafts
-  (`messages.ai_draft_body`) are populated/consumed by n8n. The UI only writes
-  `role='user'` rows and reads back assistant replies (realtime subscription).
-- Applying a recommendation or a proposed action just flips a `status` /
-  `action_status` column (and, for chat actions with a `patch`, updates the
-  target row). n8n watches those columns and does the actual Meta-side work.
+Base = `VITE_N8N_WEBHOOK_BASE`. Paths are `meta-` prefixed so they don't collide
+with the Google Ads workflows on the same n8n instance. Full details +
+importable workflows in [`n8n/`](n8n/README.md).
 
-## Proposed-action contract
+| Trigger | Webhook | Body | Response |
+|---|---|---|---|
+| Portal message sent | `meta-client-message` | `{ message_id }` | async |
+| Campaign Assistant send | `meta-campaign-chat` | `{ campaign_id, message }` | `{ id, content, proposed_action, action_status }` |
+| Confirm proposed action / launch / pause / resume | `meta-apply-campaign-action` | `{ campaign_id, proposed_action, chat_message_id? }` | `{ ok: true }` |
+| Approve & send AI draft | `meta-send-reply` | `{ message_id }` | async |
+| Campaign added | `meta-build-campaign` | `{ campaign_id }` | async |
+| "Sync Now" | `meta-sync-now` | `{}` | async |
 
-`campaign_chat_messages.proposed_action` and `messages.proposed_action` are
-rendered as a before/after diff (see `ProposedActionPreview`). Expected shape:
+Important behaviours the UI relies on:
+
+- **`meta-campaign-chat` inserts the `role='user'` row itself.** The frontend
+  only POSTs; it must not also insert the user message (double up).
+- **Approve & send** first PATCHes `messages.ai_draft_body` with the edited
+  text, *then* fires `meta-send-reply` — the workflow reads `ai_draft_body` as
+  the outbound body and inserts a fresh `outbound` row.
+- **Status changes never touch `campaigns.status` from the browser.** Approve &
+  launch / Pause / Resume all go through `meta-apply-campaign-action` so the
+  change actually happens on Meta and `pending_review` is cleared server-side.
+
+## proposed-action contract
+
+`campaign_chat_messages.proposed_action` and `messages.proposed_action` share
+this shape (identical to the Google Ads sibling):
 
 ```jsonc
 {
-  "kind": "increase_budget",
-  "summary": "Increase daily budget from $50 to $75",
-  "table": "campaigns",
-  "row_id": "<campaign uuid>",
-  "before": { "daily_budget_cents": 5000 },
-  "patch":  { "daily_budget_cents": 7500 }
+  "action_type": "update_daily_budget" | "pause_campaign" | "resume_campaign",
+  "daily_budget_usd": 75,      // required for update_daily_budget, else null
+  "reason": "Cost per lead is trending down; more budget should scale results."
 }
 ```
 
-Fields named `*_cents` or matching `/budget/i` are rendered as currency.
-Nothing is ever auto-applied — the agency clicks **Confirm & apply**.
+`ProposedActionPreview` renders it as a before→after preview. Nothing is auto-
+applied — the agency clicks **Confirm & apply**, which fires the webhook.
 
 ## Scripts
 
 - `npm run dev` — dev server on :5173
 - `npm run build` — typecheck + production build
 - `npm run typecheck` / `npm run lint`
+
+## Deploy (Netlify)
+
+`netlify.toml` + `public/_redirects` handle SPA routing (every path →
+`index.html`). Set the 3 `VITE_` env vars in Netlify (build-time), and add the
+site URL to Supabase → Authentication → URL Configuration.
