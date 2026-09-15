@@ -120,7 +120,7 @@
         "text": "=Client: {{ $json.businessName }}. Campaign: {{ $json.campaignName }} (status: {{ $json.campaignStatus }}, daily budget ${{ $json.dailyBudgetUsd || 'n/a' }}).\nPerformance to date: spend ${{ $json.totalSpend }}, results {{ $json.totalResults }}, cost per result {{ $json.costPerResult || 'n/a' }}, ROAS {{ $json.roas || 'n/a' }}.\n\nOpen Meta recommendations:\n{{ $json.recommendationsText }}\n\nClient's message:\n{{ $json.clientMessage }}",
         "hasOutputParser": true,
         "options": {
-          "systemMessage": "You are drafting a reply on behalf of a Meta (Facebook/Instagram) Ads agency to a message a client sent through the agency's in-app client portal (not email). This draft will be reviewed and edited by a human before it's sent — do not promise anything you aren't instructed to, and do not claim a change has already been made; say a requested change is being reviewed, not that it's done. Write in plain, warm, non-technical English — the reader is a small-business owner, not a marketer.\n\nproposed_action must be null UNLESS the client is clearly asking for one of exactly these three changes:\n- \"update_daily_budget\": client wants the daily budget raised/lowered/set to a specific amount. daily_budget_usd required, a plain number. If no specific number, ask a clarifying question and leave proposed_action null.\n- \"pause_campaign\": client wants the campaign paused.\n- \"resume_campaign\": client wants a paused campaign resumed.\n\nFor update_daily_budget daily_budget_usd is required; for pause/resume set it to null. Always include a one-sentence reason. Anything else (targeting, creative, general questions) gets proposed_action: null and a normal reply."
+          "systemMessage": "You are drafting a reply on behalf of a Meta (Facebook/Instagram) Ads agency to a message a client sent through the agency's in-app client portal (not email). This draft will be reviewed and edited by a human before it's sent — do not promise anything you aren't instructed to, and do not claim a change has already been made; say a requested change is being reviewed, not that it's done. Write in plain, warm, non-technical English — the reader is a small-business owner, not a marketer.\n\naction_type must be \"none\" UNLESS the client is clearly asking for one of exactly these three changes:\n- \"update_daily_budget\": client wants the daily budget raised/lowered/set to a specific amount. daily_budget_usd required, a plain positive number. If no specific number, ask a clarifying question and use action_type \"none\" instead.\n- \"pause_campaign\": client wants the campaign paused.\n- \"resume_campaign\": client wants a paused campaign resumed.\n\nFor update_daily_budget daily_budget_usd is required. For every other action_type (including \"none\"), set daily_budget_usd to 0. Always fill reason with a one-sentence explanation, or an empty string when action_type is \"none\". Anything else (targeting, creative, general questions) gets action_type \"none\" and a normal reply."
         }
       },
       "id": "b1000000-0000-0000-0000-00000000000a",
@@ -132,7 +132,7 @@
     {
       "parameters": {
         "schemaType": "manual",
-        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"reply\": { \"type\": \"string\" },\n    \"proposed_action\": {\n      \"type\": [\"object\", \"null\"],\n      \"properties\": {\n        \"action_type\": { \"type\": \"string\", \"enum\": [\"update_daily_budget\", \"pause_campaign\", \"resume_campaign\"] },\n        \"daily_budget_usd\": { \"type\": [\"number\", \"null\"] },\n        \"reason\": { \"type\": \"string\" }\n      },\n      \"required\": [\"action_type\", \"daily_budget_usd\", \"reason\"]\n    }\n  },\n  \"required\": [\"reply\", \"proposed_action\"]\n}"
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"reply\": { \"type\": \"string\" },\n    \"action_type\": { \"type\": \"string\", \"enum\": [\"none\", \"update_daily_budget\", \"pause_campaign\", \"resume_campaign\"] },\n    \"daily_budget_usd\": { \"type\": \"number\" },\n    \"reason\": { \"type\": \"string\" }\n  },\n  \"required\": [\"reply\", \"action_type\", \"daily_budget_usd\", \"reason\"]\n}"
       },
       "id": "b1000000-0000-0000-0000-00000000000b",
       "name": "Structured Output Parser",
@@ -142,16 +142,26 @@
     },
     {
       "parameters": {
-        "model": { "__rl": true, "mode": "list", "value": "gpt-5-mini" },
-        "builtInTools": {},
-        "options": {}
+        "modelName": "models/gemini-2.0-flash"
       },
-      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
-      "typeVersion": 1.3,
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
       "position": [960, 1872],
       "id": "b1000000-0000-0000-0000-00000000000c",
-      "name": "OpenAI Chat Model",
-      "credentials": { "openAiApi": { "id": "fj3WhBV98VkK9qr3", "name": "Manam- OpenAi account" } }
+      "name": "Gemini Chat Model",
+      "credentials": { "googlePalmApi": { "id": "REPLACE_WITH_GEMINI_CRED", "name": "Google Gemini(PaLM) Api account" } },
+      "notes": "Swapped from OpenAI (org ran out of credits, confirmed live 2026-09-15). Reuses the existing 'Google Gemini(PaLM) Api account' credential. modelName is a guess at a currently-available Gemini model — pick from the node's own live model dropdown if this one doesn't resolve."
+    },
+    {
+      "parameters": {
+        "jsCode": "const output = $json.output;\nconst hasAction = output.action_type && output.action_type !== 'none';\nconst proposedAction = hasAction ? {\n  action_type: output.action_type,\n  daily_budget_usd: output.action_type === 'update_daily_budget' ? output.daily_budget_usd : null,\n  reason: output.reason,\n} : null;\nreturn [{ json: { reply: output.reply, proposedAction } }];\n"
+      },
+      "id": "b1000000-0000-0000-0000-00000000000f",
+      "name": "Prepare draft",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1312, 1664],
+      "notes": "Converts the flat action_type/daily_budget_usd/reason fields (Gemini-compatible, no nullable/anyOf) back into the standard { action_type, daily_budget_usd, reason } | null proposed_action shape the frontend and apply-campaign-action/send-reply expect."
     },
     {
       "parameters": {
@@ -162,8 +172,8 @@
         "fieldsUi": {
           "fieldValues": [
             { "fieldId": "campaign_id", "fieldValue": "={{ $('Build AI context').item.json.campaignId }}" },
-            { "fieldId": "ai_draft_body", "fieldValue": "={{ $json.output.reply }}" },
-            { "fieldId": "proposed_action", "fieldValue": "={{ $json.output.proposed_action }}" },
+            { "fieldId": "ai_draft_body", "fieldValue": "={{ $json.reply }}" },
+            { "fieldId": "proposed_action", "fieldValue": "={{ $json.proposedAction }}" },
             { "fieldId": "status", "fieldValue": "drafted" }
           ]
         }
@@ -196,9 +206,10 @@
     "Get campaign metrics": { "main": [ [ { "node": "Get open recommendations", "type": "main", "index": 0 } ] ] },
     "Get open recommendations": { "main": [ [ { "node": "Build AI context", "type": "main", "index": 0 } ] ] },
     "Build AI context": { "main": [ [ { "node": "Draft reply (AI Agent)", "type": "main", "index": 0 } ] ] },
-    "Draft reply (AI Agent)": { "main": [ [ { "node": "Save draft to message", "type": "main", "index": 0 } ] ] },
+    "Draft reply (AI Agent)": { "main": [ [ { "node": "Prepare draft", "type": "main", "index": 0 } ] ] },
+    "Prepare draft": { "main": [ [ { "node": "Save draft to message", "type": "main", "index": 0 } ] ] },
     "Structured Output Parser": { "ai_outputParser": [ [ { "node": "Draft reply (AI Agent)", "type": "ai_outputParser", "index": 0 } ] ] },
-    "OpenAI Chat Model": { "ai_languageModel": [ [ { "node": "Draft reply (AI Agent)", "type": "ai_languageModel", "index": 0 } ] ] },
+    "Gemini Chat Model": { "ai_languageModel": [ [ { "node": "Draft reply (AI Agent)", "type": "ai_languageModel", "index": 0 } ] ] },
     "Save draft to message": { "main": [ [ { "node": "Notify: needs review", "type": "main", "index": 0 } ] ] }
   },
   "pinData": {},

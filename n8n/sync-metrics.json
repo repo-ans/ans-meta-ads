@@ -246,6 +246,15 @@
       "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } }
     },
     {
+      "parameters": { "mode": "append", "numberInputs": 2 },
+      "id": "e1000000-0000-0000-0000-000000000019",
+      "name": "Wait for recommendations",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1600, 400],
+      "notes": "Pure synchronization barrier — 'Build suggestion context' reads $('Build recommendation items').all() by name, but that node lives on a parallel branch with no other connection back to this one. Without this Merge, n8n can run 'Build suggestion context' before 'Build recommendation items' has finished, throwing \"Node ... hasn't been executed\" (confirmed live) — same root cause as the 'Wait For All Fetches' fix in the Phase-1 reporting agent. The merged output itself isn't used; Build suggestion context still reads every source by name."
+    },
+    {
       "parameters": {
         "jsCode": "const campaigns = $('Filter synced campaigns').all();\nconst metricsRows = $('Build metrics row').all();\nconst allRecs = $('Build recommendation items').all().map(i => i.json).filter(r => r && r.campaign_id);\nreturn campaigns.map((c, i) => {\n  const m = (metricsRows[i] && metricsRows[i].json) || {};\n  const recRows = allRecs.filter(r => r.campaign_id === c.json.campaignRowId);\n  const roas = m.roas != null ? m.roas : null;\n  const recsText = recRows.length ? recRows.map(r => '- ' + r.type).join('\\n') : 'None currently open.';\n  return { json: {\n    campaignRowId: c.json.campaignRowId,\n    campaignName: c.json.campaignName,\n    status: c.json.status,\n    objective: c.json.objective,\n    dailyBudgetUsd: c.json.dailyBudgetUsd,\n    date: m.date,\n    spend: m.spend,\n    results: m.results,\n    costPerResult: m.cost_per_result,\n    roas,\n    recommendationsText: recsText,\n  } };\n});\n"
       },
@@ -253,7 +262,7 @@
       "name": "Build suggestion context",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1600, 300]
+      "position": [1824, 300]
     },
     {
       "parameters": {
@@ -261,7 +270,7 @@
         "text": "=Campaign: {{ $json.campaignName }} (status: {{ $json.status }}, objective {{ $json.objective }}, daily budget ${{ $json.dailyBudgetUsd }}).\nYesterday ({{ $json.date }}): spend ${{ $json.spend }}, results {{ $json.results }}, cost per result {{ $json.costPerResult || 'n/a' }}, ROAS {{ $json.roas || 'n/a' }}.\n\nOpen Meta recommendations:\n{{ $json.recommendationsText }}",
         "hasOutputParser": true,
         "options": {
-          "systemMessage": "You are reviewing this Meta (Facebook/Instagram) Ads campaign's daily performance sync automatically, on behalf of an agency, with no human having asked a question. Decide whether there's a genuinely useful, specific, non-obvious suggestion worth surfacing right now — a clear problem (real spend with zero results, runaway cost per result, obvious frequency/fatigue issue) or a binding budget. Be conservative: should_post = false unless something actually stands out. A missed suggestion beats noise the agency learns to ignore.\n\nWhen should_post is true, proposed_action follows the same rules as everywhere in this project: null UNLESS you're suggesting exactly one of update_daily_budget (daily_budget_usd required, a specific number), pause_campaign, or resume_campaign, with a one-sentence reason. Most posts have proposed_action: null."
+          "systemMessage": "You are reviewing this Meta (Facebook/Instagram) Ads campaign's daily performance sync automatically, on behalf of an agency, with no human having asked a question. Decide whether there's a genuinely useful, specific, non-obvious suggestion worth surfacing right now — a clear problem (real spend with zero results, runaway cost per result, obvious frequency/fatigue issue) or a binding budget. Be conservative: should_post = false unless something actually stands out. A missed suggestion beats noise the agency learns to ignore.\n\nWhen should_post is true, action_type follows the same rules as everywhere in this project: \"none\" UNLESS you're suggesting exactly one of update_daily_budget (daily_budget_usd required, a specific positive number), pause_campaign, or resume_campaign, with a one-sentence reason in the reason field. For action_type \"none\" (most posts), set daily_budget_usd to 0 and reason to an empty string."
         }
       },
       "id": "e1000000-0000-0000-0000-000000000013",
@@ -273,7 +282,7 @@
     {
       "parameters": {
         "schemaType": "manual",
-        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"should_post\": { \"type\": \"boolean\" },\n    \"message\": { \"type\": \"string\" },\n    \"proposed_action\": {\n      \"type\": [\"object\", \"null\"],\n      \"properties\": {\n        \"action_type\": { \"type\": \"string\", \"enum\": [\"update_daily_budget\", \"pause_campaign\", \"resume_campaign\"] },\n        \"daily_budget_usd\": { \"type\": [\"number\", \"null\"] },\n        \"reason\": { \"type\": \"string\" }\n      },\n      \"required\": [\"action_type\", \"daily_budget_usd\", \"reason\"]\n    }\n  },\n  \"required\": [\"should_post\", \"message\", \"proposed_action\"]\n}"
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"should_post\": { \"type\": \"boolean\" },\n    \"message\": { \"type\": \"string\" },\n    \"action_type\": { \"type\": \"string\", \"enum\": [\"none\", \"update_daily_budget\", \"pause_campaign\", \"resume_campaign\"] },\n    \"daily_budget_usd\": { \"type\": \"number\" },\n    \"reason\": { \"type\": \"string\" }\n  },\n  \"required\": [\"should_post\", \"message\", \"action_type\", \"daily_budget_usd\", \"reason\"]\n}"
       },
       "id": "e1000000-0000-0000-0000-000000000014",
       "name": "Structured Output Parser",
@@ -283,20 +292,19 @@
     },
     {
       "parameters": {
-        "model": { "__rl": true, "mode": "list", "value": "gpt-5-mini" },
-        "builtInTools": {},
-        "options": {}
+        "modelName": "models/gemini-2.0-flash"
       },
-      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
-      "typeVersion": 1.3,
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
       "position": [1840, 500],
       "id": "e1000000-0000-0000-0000-000000000015",
-      "name": "OpenAI Chat Model",
-      "credentials": { "openAiApi": { "id": "fj3WhBV98VkK9qr3", "name": "Manam- OpenAi account" } }
+      "name": "Gemini Chat Model",
+      "credentials": { "googlePalmApi": { "id": "REPLACE_WITH_GEMINI_CRED", "name": "Google Gemini(PaLM) Api account" } },
+      "notes": "Swapped from OpenAI (org ran out of credits, confirmed live 2026-09-15). Reuses the existing 'Google Gemini(PaLM) Api account' credential. modelName is a guess at a currently-available Gemini model — pick from the node's own live model dropdown if this one doesn't resolve."
     },
     {
       "parameters": {
-        "jsCode": "const aiOutputs = $input.all();\nconst contexts = $('Build suggestion context').all();\nreturn aiOutputs.map((item, i) => {\n  const output = item.json.output || {};\n  return { json: {\n    campaignRowId: (contexts[i] && contexts[i].json.campaignRowId) || null,\n    shouldPost: !!output.should_post,\n    message: output.message,\n    proposedAction: output.proposed_action || null,\n    actionStatus: output.proposed_action ? 'proposed' : null,\n  } };\n});\n"
+        "jsCode": "const aiOutputs = $input.all();\nconst contexts = $('Build suggestion context').all();\nreturn aiOutputs.map((item, i) => {\n  const output = item.json.output || {};\n  const hasAction = output.action_type && output.action_type !== 'none';\n  const proposedAction = hasAction ? {\n    action_type: output.action_type,\n    daily_budget_usd: output.action_type === 'update_daily_budget' ? output.daily_budget_usd : null,\n    reason: output.reason,\n  } : null;\n  return { json: {\n    campaignRowId: (contexts[i] && contexts[i].json.campaignRowId) || null,\n    shouldPost: !!output.should_post,\n    message: output.message,\n    proposedAction,\n    actionStatus: hasAction ? 'proposed' : null,\n  } };\n});\n"
       },
       "id": "e1000000-0000-0000-0000-000000000016",
       "name": "Prepare suggestion",
@@ -442,17 +450,18 @@
     "Fetch insights": { "main": [ [ { "node": "Build metrics row", "type": "main", "index": 0 } ] ] },
     "Build metrics row": { "main": [ [ { "node": "Delete existing metrics row", "type": "main", "index": 0 } ] ] },
     "Delete existing metrics row": { "main": [ [ { "node": "Create metrics row", "type": "main", "index": 0 } ] ] },
-    "Create metrics row": { "main": [ [ { "node": "Build suggestion context", "type": "main", "index": 0 } ] ] },
+    "Create metrics row": { "main": [ [ { "node": "Wait for recommendations", "type": "main", "index": 0 } ] ] },
     "Fetch recommendations": { "main": [ [ { "node": "Delete existing open recommendations", "type": "main", "index": 0 } ] ] },
     "Delete existing open recommendations": { "main": [ [ { "node": "Build recommendation items", "type": "main", "index": 0 } ] ] },
-    "Build recommendation items": { "main": [ [ { "node": "Create recommendation row", "type": "main", "index": 0 } ] ] },
+    "Build recommendation items": { "main": [ [ { "node": "Create recommendation row", "type": "main", "index": 0 }, { "node": "Wait for recommendations", "type": "main", "index": 1 } ] ] },
+    "Wait for recommendations": { "main": [ [ { "node": "Build suggestion context", "type": "main", "index": 0 } ] ] },
     "Fetch campaign config": { "main": [ [ { "node": "Fetch adset budget", "type": "main", "index": 0 } ] ] },
     "Fetch adset budget": { "main": [ [ { "node": "Reconcile config", "type": "main", "index": 0 } ] ] },
     "Reconcile config": { "main": [ [ { "node": "Update campaign config", "type": "main", "index": 0 } ] ] },
     "Build suggestion context": { "main": [ [ { "node": "Suggest (AI Agent)", "type": "main", "index": 0 } ] ] },
     "Suggest (AI Agent)": { "main": [ [ { "node": "Prepare suggestion", "type": "main", "index": 0 } ] ] },
     "Structured Output Parser": { "ai_outputParser": [ [ { "node": "Suggest (AI Agent)", "type": "ai_outputParser", "index": 0 } ] ] },
-    "OpenAI Chat Model": { "ai_languageModel": [ [ { "node": "Suggest (AI Agent)", "type": "ai_languageModel", "index": 0 } ] ] },
+    "Gemini Chat Model": { "ai_languageModel": [ [ { "node": "Suggest (AI Agent)", "type": "ai_languageModel", "index": 0 } ] ] },
     "Prepare suggestion": { "main": [ [ { "node": "Should post?", "type": "main", "index": 0 } ] ] },
     "Should post?": { "main": [ [ { "node": "Insert proactive suggestion", "type": "main", "index": 0 } ], [] ] },
     "Get all clients": { "main": [ [ { "node": "Get owned ad accounts", "type": "main", "index": 0 } ] ] },
