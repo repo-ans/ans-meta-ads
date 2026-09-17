@@ -215,13 +215,13 @@ export default function CampaignDetail() {
       <div className="mt-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Stat
           label="Spend (7d)"
-          value={formatMoney(cur.spend || null)}
+          value={formatMoney(cur.spend)}
           change={pctChange(cur.spend, prev.spend)}
           invert
         />
         <Stat
           label="Results (7d)"
-          value={formatNumber(cur.results || null)}
+          value={formatNumber(cur.results)}
           change={pctChange(cur.results, prev.results)}
         />
         <Stat
