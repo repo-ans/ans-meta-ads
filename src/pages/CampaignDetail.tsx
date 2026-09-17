@@ -14,7 +14,7 @@ import { CampaignStatusBadge } from '../components/CampaignStatusBadge'
 import { AlertsList } from '../components/AlertsList'
 import { RecommendationsList } from '../components/RecommendationsList'
 import { CampaignChat } from '../components/CampaignChat'
-import { Button, Card, Spinner, cn } from '../components/ui'
+import { Button, Card, Field, Modal, Spinner, TextArea, cn } from '../components/ui'
 
 type Tab = 'recommendations' | 'assistant'
 
@@ -52,6 +52,7 @@ export default function CampaignDetail() {
   const [error, setError] = useState<string | null>(null)
   const [tab, setTab] = useState<Tab>('recommendations')
   const [statusBusy, setStatusBusy] = useState(false)
+  const [editingGoals, setEditingGoals] = useState(false)
 
   const load = useCallback(async () => {
     if (!campaignId) return
@@ -238,19 +239,45 @@ export default function CampaignDetail() {
       </div>
 
       {/* Campaign settings summary */}
-      <Card className="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 p-4 text-sm sm:grid-cols-3">
-        <Detail label="Daily budget" value={formatMoney(campaign.daily_budget_usd)} />
-        <Detail label="Bid strategy" value={campaign.bid_strategy} />
-        <Detail
-          label="Targeting"
-          value={`${campaign.targeting_countries?.join(', ') || '—'} · age ${
-            campaign.targeting_age_min ?? '—'
-          }–${campaign.targeting_age_max ?? '—'}`}
-        />
-        <Detail label="Primary goal" value={campaign.primary_goal || '—'} />
-        <Detail label="Business objective" value={campaign.business_objective || '—'} />
-        <Detail label="Meta campaign ID" value={campaign.meta_campaign_id || '—'} mono />
+      <Card className="mt-4 p-4">
+        <div className="mb-1 flex items-center justify-between">
+          <p className="text-xs uppercase tracking-wide text-slate-400">Settings</p>
+          <button
+            onClick={() => setEditingGoals(true)}
+            className="text-xs font-medium text-brand-700 hover:underline"
+          >
+            Edit goal &amp; objective
+          </button>
+        </div>
+        <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
+          <Detail label="Daily budget" value={formatMoney(campaign.daily_budget_usd)} />
+          <Detail label="Bid strategy" value={campaign.bid_strategy} />
+          <Detail
+            label="Targeting"
+            value={`${campaign.targeting_countries?.join(', ') || '—'} · age ${
+              campaign.targeting_age_min ?? '—'
+            }–${campaign.targeting_age_max ?? '—'}`}
+          />
+          <Detail
+            label="Primary goal"
+            value={campaign.primary_goal || 'Not set — this campaign wasn’t built here'}
+            faint={!campaign.primary_goal}
+          />
+          <Detail
+            label="Business objective"
+            value={campaign.business_objective || 'Not set — this campaign wasn’t built here'}
+            faint={!campaign.business_objective}
+          />
+          <Detail label="Meta campaign ID" value={campaign.meta_campaign_id || '—'} mono />
+        </div>
       </Card>
+
+      <EditGoalsModal
+        open={editingGoals}
+        campaign={campaign}
+        onClose={() => setEditingGoals(false)}
+        onSaved={(updated) => setCampaign(updated)}
+      />
 
       {/* Tabs */}
       <div className="mt-6 border-b border-slate-200">
@@ -314,16 +341,106 @@ function Detail({
   label,
   value,
   mono,
+  faint,
 }: {
   label: string
   value: string
   mono?: boolean
+  faint?: boolean
 }) {
   return (
     <div>
       <p className="text-xs uppercase tracking-wide text-slate-400">{label}</p>
-      <p className={cn('text-slate-800', mono && 'font-mono text-xs')}>{value}</p>
+      <p className={cn('text-slate-800', mono && 'font-mono text-xs', faint && 'italic text-slate-400')}>
+        {value}
+      </p>
     </div>
+  )
+}
+
+// Primary goal / business objective are intake-form concepts — a campaign
+// discovered on Meta rather than built through this app has no answer for
+// them until someone types one in here.
+function EditGoalsModal({
+  open,
+  campaign,
+  onClose,
+  onSaved,
+}: {
+  open: boolean
+  campaign: Campaign | null
+  onClose: () => void
+  onSaved: (updated: Campaign) => void
+}) {
+  const [primaryGoal, setPrimaryGoal] = useState('')
+  const [businessObjective, setBusinessObjective] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (open && campaign) {
+      setPrimaryGoal(campaign.primary_goal ?? '')
+      setBusinessObjective(campaign.business_objective ?? '')
+      setError(null)
+    }
+  }, [open, campaign])
+
+  async function save() {
+    if (!campaign) return
+    setSaving(true)
+    setError(null)
+    const { data, error } = await supabase
+      .from('campaigns')
+      .update({
+        primary_goal: primaryGoal.trim() || null,
+        business_objective: businessObjective.trim() || null,
+      })
+      .eq('id', campaign.id)
+      .select()
+      .single()
+    setSaving(false)
+    if (error) {
+      setError(error.message)
+      return
+    }
+    onSaved(data as Campaign)
+    onClose()
+  }
+
+  return (
+    <Modal open={open} onClose={onClose} title="Edit goal & objective">
+      <div className="space-y-4">
+        <Field
+          label="Primary goal"
+          hint="Free text — what success looks like for this campaign."
+        >
+          <TextArea
+            rows={2}
+            value={primaryGoal}
+            onChange={(e) => setPrimaryGoal(e.target.value)}
+          />
+        </Field>
+        <Field
+          label="Business objective"
+          hint="Free text — the wider context behind this campaign."
+        >
+          <TextArea
+            rows={2}
+            value={businessObjective}
+            onChange={(e) => setBusinessObjective(e.target.value)}
+          />
+        </Field>
+        {error && <p className="text-sm text-red-600">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={save} disabled={saving}>
+            {saving ? 'Saving…' : 'Save'}
+          </Button>
+        </div>
+      </div>
+    </Modal>
   )
 }
 

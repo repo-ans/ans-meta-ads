@@ -204,10 +204,11 @@
     {
       "parameters": {
         "method": "GET",
-        "url": "=https://graph.facebook.com/v21.0/{{ $('Filter synced campaigns').item.json.metaAdsetId || $('Filter synced campaigns').item.json.metaCampaignId }}",
+        "url": "={{ $('Filter synced campaigns').item.json.metaAdsetId ? ('https://graph.facebook.com/v21.0/' + $('Filter synced campaigns').item.json.metaAdsetId) : ('https://graph.facebook.com/v21.0/' + $('Filter synced campaigns').item.json.metaCampaignId + '/adsets') }}",
         "sendQuery": true,
         "queryParameters": { "parameters": [
-          { "name": "fields", "value": "daily_budget" },
+          { "name": "fields", "value": "id,daily_budget,targeting" },
+          { "name": "limit", "value": "1" },
           { "name": "access_token", "value": "={{ $('Filter synced campaigns').item.json.accessToken }}" }
         ] },
         "options": {}
@@ -217,18 +218,18 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [880, 700],
-      "notes": "Falls back to querying the campaign id when there's no meta_adset_id (harmless — just returns the campaign's daily_budget or nothing)."
+      "notes": "When meta_adset_id is already known, fetches that ad set directly (returns a plain object). When it's missing (e.g. a discovered campaign we never captured the ad set id for), falls back to the campaign's /adsets edge instead (returns { data: [...] }) and picks the first one — this is also how meta_adset_id gets backfilled, in 'Reconcile config'. 'limit' is ignored (harmlessly) on the direct-object call."
     },
     {
       "parameters": {
-        "jsCode": "const campaigns = $('Filter synced campaigns').all();\nconst configs = $('Fetch campaign config').all();\nconst budgets = $('Fetch adset budget').all();\nconst statusMap = { ACTIVE: 'active', PAUSED: 'paused' };\nconst out = [];\ncampaigns.forEach((c, i) => {\n  const cfg = (configs[i] && configs[i].json) || {};\n  const bud = (budgets[i] && budgets[i].json) || {};\n  if (!cfg.status && !cfg.effective_status) return; // campaign gone / no data\n  const raw = cfg.effective_status && ['CAMPAIGN_PAUSED','PAUSED','ADSET_PAUSED'].includes(cfg.effective_status) ? 'PAUSED' : cfg.status;\n  const minor = Number(bud.daily_budget || cfg.daily_budget || 0);\n  out.push({ json: {\n    campaignRowId: c.json.campaignRowId,\n    status: statusMap[raw] || 'paused',\n    dailyBudgetUsd: minor > 0 ? minor / 100 : c.json.dailyBudgetUsd,\n  } });\n});\nreturn out;\n"
+        "jsCode": "const campaigns = $('Filter synced campaigns').all();\nconst configs = $('Fetch campaign config').all();\nconst budgets = $('Fetch adset budget').all();\nconst statusMap = { ACTIVE: 'active', PAUSED: 'paused' };\nconst out = [];\ncampaigns.forEach((c, i) => {\n  const cfg = (configs[i] && configs[i].json) || {};\n  const budRaw = (budgets[i] && budgets[i].json) || {};\n  // Direct ad set fetch returns the object itself; the campaign's /adsets\n  // fallback (used when meta_adset_id was never captured) returns\n  // { data: [...] } instead — normalize both to one object.\n  const bud = Array.isArray(budRaw.data) ? (budRaw.data[0] || {}) : budRaw;\n  if (!cfg.status && !cfg.effective_status) return; // campaign gone / no data\n  const raw = cfg.effective_status && ['CAMPAIGN_PAUSED','PAUSED','ADSET_PAUSED'].includes(cfg.effective_status) ? 'PAUSED' : cfg.status;\n  const minor = Number(bud.daily_budget || cfg.daily_budget || 0);\n  const geo = (bud.targeting && bud.targeting.geo_locations) || {};\n  // Meta targeting isn't always country-level — a local-service campaign\n  // commonly targets specific regions/cities instead (confirmed live: a\n  // 'KW/Cambridge/Guelph' campaign had no geo_locations.countries at all).\n  // targeting_countries is really just \"targeting places\" at this point;\n  // fall back to region/city names so the dashboard shows something real\n  // instead of a blank that reads as broken.\n  let places = null;\n  if (Array.isArray(geo.countries) && geo.countries.length) {\n    places = geo.countries;\n  } else if (Array.isArray(geo.regions) && geo.regions.length) {\n    places = geo.regions.map(r => r.name).filter(Boolean);\n  } else if (Array.isArray(geo.cities) && geo.cities.length) {\n    places = geo.cities.map(c => c.name).filter(Boolean);\n  }\n  const targeting = bud.targeting || {};\n  out.push({ json: {\n    campaignRowId: c.json.campaignRowId,\n    status: statusMap[raw] || 'paused',\n    dailyBudgetUsd: minor > 0 ? minor / 100 : c.json.dailyBudgetUsd,\n    metaAdsetId: bud.id || c.json.metaAdsetId || null,\n    targetingCountries: places,\n    targetingAgeMin: targeting.age_min != null ? targeting.age_min : null,\n    targetingAgeMax: targeting.age_max != null ? targeting.age_max : null,\n  } });\n});\nreturn out;\n"
       },
       "id": "e1000000-0000-0000-0000-000000000010",
       "name": "Reconcile config",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [1120, 700],
-      "notes": "Reconciles campaigns.status + daily_budget_usd to whatever Meta actually reports — catches changes made directly in Ads Manager. Does NOT touch pending_review (a build-time / launch-decision concept, not something Meta knows about)."
+      "notes": "Reconciles campaigns.status + daily_budget_usd + meta_adset_id + targeting to whatever Meta actually reports — catches changes made directly in Ads Manager, and self-heals campaigns discovered before we captured their ad set (meta_adset_id was null, so budget/targeting stayed blank forever until this ran). Does NOT touch pending_review (a build-time / launch-decision concept, not something Meta knows about)."
     },
     {
       "parameters": {
@@ -236,7 +237,14 @@
         "tableId": "campaigns",
         "matchType": "allFilters",
         "filters": { "conditions": [ { "keyName": "id", "condition": "eq", "keyValue": "={{ $json.campaignRowId }}" } ] },
-        "fieldsUi": { "fieldValues": [ { "fieldId": "status", "fieldValue": "={{ $json.status }}" }, { "fieldId": "daily_budget_usd", "fieldValue": "={{ $json.dailyBudgetUsd }}" } ] }
+        "fieldsUi": { "fieldValues": [
+          { "fieldId": "status", "fieldValue": "={{ $json.status }}" },
+          { "fieldId": "daily_budget_usd", "fieldValue": "={{ $json.dailyBudgetUsd }}" },
+          { "fieldId": "meta_adset_id", "fieldValue": "={{ $json.metaAdsetId }}" },
+          { "fieldId": "targeting_countries", "fieldValue": "={{ $json.targetingCountries }}" },
+          { "fieldId": "targeting_age_min", "fieldValue": "={{ $json.targetingAgeMin }}" },
+          { "fieldId": "targeting_age_max", "fieldValue": "={{ $json.targetingAgeMax }}" }
+        ] }
       },
       "id": "e1000000-0000-0000-0000-000000000011",
       "name": "Update campaign config",
