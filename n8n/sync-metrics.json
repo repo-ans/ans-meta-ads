@@ -58,7 +58,7 @@
         "sendQuery": true,
         "queryParameters": { "parameters": [
           { "name": "fields", "value": "spend,impressions,clicks,cpm,cpc,ctr,frequency,actions,cost_per_action_type,purchase_roas" },
-          { "name": "time_range", "value": "={{ JSON.stringify({ since: new Date(Date.now() - 86400000).toISOString().slice(0, 10), until: new Date().toISOString().slice(0, 10) }) }}" },
+          { "name": "time_range", "value": "={{ JSON.stringify({ since: new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10), until: new Date().toISOString().slice(0, 10) }) }}" },
           { "name": "time_increment", "value": "1" },
           { "name": "access_token", "value": "={{ $json.accessToken }}" }
         ] },
@@ -69,7 +69,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [640, 300],
-      "notes": "time_range (yesterday..today) + time_increment=1 returns one row per day instead of a single aggregate — so 'today, still accumulating' shows up alongside yesterday's final number, closer to what Ads Manager shows on demand. Meta returns { data: [] } for a campaign with no spend at all in the window — normal, not an error. 'Build metrics row' falls back to a zero row so daily history stays gap-free."
+      "notes": "time_range (last 30 days..today) + time_increment=1 returns one row per day instead of a single aggregate. 30 days (not just yesterday+today) so a campaign that was already running on Meta before this platform started tracking it gets its real prior spend backfilled — confirmed live: a discovered campaign that pre-dated our sync was showing spend $20+ lower than Ads Manager because only days since discovery had ever been synced. Re-running the full 30-day window every sync (not just once) also picks up Meta's own retroactive corrections (delivery/attribution can adjust a day's numbers for a few days after it happens). One HTTP call either way — time_increment doesn't cost extra requests, just returns more rows. Meta returns { data: [] } for a campaign with no spend at all in the window — normal, not an error. 'Build metrics row' falls back to a zero row so daily history stays gap-free."
     },
     {
       "parameters": {

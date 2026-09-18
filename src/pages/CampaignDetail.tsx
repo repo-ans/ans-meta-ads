@@ -212,7 +212,17 @@ export default function CampaignDetail() {
         <Stat label="Spend (all time)" value={formatMoney(cur.spend)} />
         <Stat label="Results (all time)" value={formatNumber(cur.results)} />
         <Stat label="Cost / Result" value={formatMoney(curCpr)} />
-        <Stat label="ROAS" value={formatRoas(curRoas)} />
+        <Stat
+          label="ROAS"
+          value={curRoas != null ? formatRoas(curRoas) : 'N/A'}
+          hint={
+            curRoas != null
+              ? undefined
+              : campaign.objective === 'OUTCOME_SALES'
+                ? 'no purchase value tracked yet'
+                : `not tracked for ${campaign.objective.replace('OUTCOME_', '').toLowerCase()} campaigns`
+          }
+        />
       </div>
 
       {/* Campaign settings summary */}
@@ -288,12 +298,22 @@ export default function CampaignDetail() {
   )
 }
 
-function Stat({ label, value }: { label: string; value: string }) {
+function Stat({
+  label,
+  value,
+  hint,
+}: {
+  label: string
+  value: string
+  hint?: string
+}) {
   return (
     <Card className="p-4">
       <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
       <p className="mt-1 text-2xl font-semibold">{value}</p>
-      <p className="mt-1 text-xs text-slate-400">since this campaign started syncing</p>
+      <p className="mt-1 text-xs text-slate-400">
+        {hint ?? 'since this campaign started syncing'}
+      </p>
     </Card>
   )
 }
