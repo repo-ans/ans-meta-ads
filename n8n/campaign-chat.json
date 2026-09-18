@@ -171,7 +171,8 @@
             { "fieldId": "role", "fieldValue": "assistant" },
             { "fieldId": "content", "fieldValue": "={{ $json.content }}" },
             { "fieldId": "proposed_action", "fieldValue": "={{ $json.proposedAction }}" },
-            { "fieldId": "action_status", "fieldValue": "={{ $json.actionStatus }}" }
+            { "fieldId": "action_status", "fieldValue": "={{ $json.actionStatus }}" },
+            { "fieldId": "origin", "fieldValue": "user_reply" }
           ]
         }
       },

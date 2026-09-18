@@ -7,32 +7,30 @@ import type {
   Client,
   ProposedActionType,
 } from '../lib/database.types'
-import { formatMoney, formatNumber, formatRoas, pctChange } from '../lib/format'
+import { formatMoney, formatNumber, formatRoas } from '../lib/format'
 import { applyCampaignAction, WebhookError } from '../lib/webhooks'
 import { DashboardLayout } from '../components/layout/DashboardLayout'
 import { CampaignStatusBadge } from '../components/CampaignStatusBadge'
 import { AlertsList } from '../components/AlertsList'
 import { RecommendationsList } from '../components/RecommendationsList'
+import { ProactiveSuggestions } from '../components/ProactiveSuggestions'
 import { CampaignChat } from '../components/CampaignChat'
 import { Button, Card, Field, Modal, Spinner, TextArea, cn } from '../components/ui'
 
 type Tab = 'recommendations' | 'assistant'
 
-interface Window7d {
+interface MetricTotals {
   spend: number
   results: number
   roasSum: number
   roasN: number
 }
 
-function sumWindow(rows: CampaignMetric[], startDaysAgo: number, endDaysAgo: number): Window7d {
-  const now = Date.now()
-  const start = now - startDaysAgo * 864e5
-  const end = now - endDaysAgo * 864e5
-  const w: Window7d = { spend: 0, results: 0, roasSum: 0, roasN: 0 }
+// All-time totals across every synced day — no rolling window, so there's
+// no "vs Meta's dashboard right now" mismatch from window boundaries.
+function sumAll(rows: CampaignMetric[]): MetricTotals {
+  const w: MetricTotals = { spend: 0, results: 0, roasSum: 0, roasN: 0 }
   for (const r of rows) {
-    const t = new Date(r.date).getTime()
-    if (t < start || t >= end) continue
     w.spend += Number(r.spend ?? 0)
     w.results += Number(r.results ?? 0)
     if (r.roas != null) {
@@ -64,7 +62,7 @@ export default function CampaignDetail() {
         .select('*')
         .eq('campaign_id', campaignId)
         .order('date', { ascending: false })
-        .limit(60),
+        .limit(3660), // ~10 years of daily rows — stat cards now sum all-time, not a 7-day window
     ])
     if (cam.error) {
       setError(cam.error.message)
@@ -126,12 +124,9 @@ export default function CampaignDetail() {
     )
   }
 
-  const cur = sumWindow(metrics, 7, 0)
-  const prev = sumWindow(metrics, 14, 7)
+  const cur = sumAll(metrics)
   const curCpr = cur.results > 0 ? cur.spend / cur.results : null
-  const prevCpr = prev.results > 0 ? prev.spend / prev.results : null
   const curRoas = cur.roasN > 0 ? cur.roasSum / cur.roasN : null
-  const prevRoas = prev.roasN > 0 ? prev.roasSum / prev.roasN : null
 
   const isPendingReview = campaign.status === 'paused' && campaign.pending_review
 
@@ -214,28 +209,10 @@ export default function CampaignDetail() {
 
       {/* Stat cards */}
       <div className="mt-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Stat
-          label="Spend (7d)"
-          value={formatMoney(cur.spend)}
-          change={pctChange(cur.spend, prev.spend)}
-          invert
-        />
-        <Stat
-          label="Results (7d)"
-          value={formatNumber(cur.results)}
-          change={pctChange(cur.results, prev.results)}
-        />
-        <Stat
-          label="Cost / Result"
-          value={formatMoney(curCpr)}
-          change={pctChange(curCpr, prevCpr)}
-          invert
-        />
-        <Stat
-          label="ROAS"
-          value={formatRoas(curRoas)}
-          change={pctChange(curRoas, prevRoas)}
-        />
+        <Stat label="Spend (all time)" value={formatMoney(cur.spend)} />
+        <Stat label="Results (all time)" value={formatNumber(cur.results)} />
+        <Stat label="Cost / Result" value={formatMoney(curCpr)} />
+        <Stat label="ROAS" value={formatRoas(curRoas)} />
       </div>
 
       {/* Campaign settings summary */}
@@ -293,7 +270,13 @@ export default function CampaignDetail() {
 
       <div className="mt-4">
         {tab === 'recommendations' ? (
-          <RecommendationsList campaignId={campaign.id} />
+          <>
+            <ProactiveSuggestions
+              campaignId={campaign.id}
+              currentBudgetUsd={campaign.daily_budget_usd}
+            />
+            <RecommendationsList campaignId={campaign.id} />
+          </>
         ) : (
           <CampaignChat
             campaignId={campaign.id}
@@ -305,34 +288,12 @@ export default function CampaignDetail() {
   )
 }
 
-function Stat({
-  label,
-  value,
-  change,
-  invert,
-}: {
-  label: string
-  value: string
-  change: { pct: number; direction: 'up' | 'down' | 'flat' } | null
-  invert?: boolean
-}) {
-  // invert: for spend / cost-per-result, "up" is bad (red), "down" is good.
-  let tone = 'text-slate-400'
-  if (change && change.direction !== 'flat') {
-    const good = invert ? change.direction === 'down' : change.direction === 'up'
-    tone = good ? 'text-green-600' : 'text-red-600'
-  }
+function Stat({ label, value }: { label: string; value: string }) {
   return (
     <Card className="p-4">
       <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
       <p className="mt-1 text-2xl font-semibold">{value}</p>
-      <p className={cn('mt-1 text-xs', tone)}>
-        {change
-          ? `${change.direction === 'up' ? '▲' : change.direction === 'down' ? '▼' : '—'} ${Math.abs(
-              change.pct,
-            ).toFixed(0)}% vs prior 7d`
-          : 'no prior-week data'}
-      </p>
+      <p className="mt-1 text-xs text-slate-400">since this campaign started syncing</p>
     </Card>
   )
 }

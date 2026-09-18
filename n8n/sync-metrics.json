@@ -58,7 +58,8 @@
         "sendQuery": true,
         "queryParameters": { "parameters": [
           { "name": "fields", "value": "spend,impressions,clicks,cpm,cpc,ctr,frequency,actions,cost_per_action_type,purchase_roas" },
-          { "name": "date_preset", "value": "yesterday" },
+          { "name": "time_range", "value": "={{ JSON.stringify({ since: new Date(Date.now() - 86400000).toISOString().slice(0, 10), until: new Date().toISOString().slice(0, 10) }) }}" },
+          { "name": "time_increment", "value": "1" },
           { "name": "access_token", "value": "={{ $json.accessToken }}" }
         ] },
         "options": {}
@@ -68,11 +69,11 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [640, 300],
-      "notes": "Meta returns { data: [] } for a campaign with no spend yesterday — that is normal, not an error. 'Build metrics row' falls back to a zero row so daily history stays gap-free."
+      "notes": "time_range (yesterday..today) + time_increment=1 returns one row per day instead of a single aggregate — so 'today, still accumulating' shows up alongside yesterday's final number, closer to what Ads Manager shows on demand. Meta returns { data: [] } for a campaign with no spend at all in the window — normal, not an error. 'Build metrics row' falls back to a zero row so daily history stays gap-free."
     },
     {
       "parameters": {
-        "jsCode": "const campaigns = $('Filter synced campaigns').all();\nconst searches = $('Fetch insights').all();\nconst fallbackDate = new Date(Date.now() - 86400000).toISOString().slice(0, 10);\n\n// action_type values that count as a 'result', in priority order. Meta varies\n// by account/objective — mirror the Phase-1 reporting agent's lead matching.\nconst RESULT_TYPES = ['lead','onsite_conversion.lead_grouped','offsite_conversion.fdt_lead','leadgen.other','onsite_web_lead','offsite_conversion.fdt_purchase','purchase','omni_purchase','link_click'];\n\nfunction pickResults(actions) {\n  if (!Array.isArray(actions)) return 0;\n  for (const t of RESULT_TYPES) {\n    const hit = actions.find(a => a.action_type === t);\n    if (hit) return Number(hit.value || 0);\n  }\n  return 0;\n}\n\nreturn campaigns.map((c, i) => {\n  const data = (searches[i] && searches[i].json.data) || [];\n  const row = data[0];\n  const spend = row ? Number(row.spend || 0) : 0;\n  const results = row ? pickResults(row.actions) : 0;\n  const roasArr = row && Array.isArray(row.purchase_roas) ? row.purchase_roas : [];\n  const roas = roasArr.length ? Number(roasArr[0].value || 0) : null;\n  return { json: {\n    campaign_id: c.json.campaignRowId,\n    date: row ? (row.date_start || fallbackDate) : fallbackDate,\n    spend,\n    results,\n    cost_per_result: results > 0 ? spend / results : null,\n    impressions: row ? Number(row.impressions || 0) : 0,\n    clicks: row ? Number(row.clicks || 0) : 0,\n    cpm: row ? Number(row.cpm || 0) : 0,\n    cpc: row ? Number(row.cpc || 0) : 0,\n    ctr: row ? Number(row.ctr || 0) : 0,\n    frequency: row ? Number(row.frequency || 0) : 0,\n    roas,\n  } };\n});\n"
+        "jsCode": "const campaigns = $('Filter synced campaigns').all();\nconst searches = $('Fetch insights').all();\nconst fallbackDate = new Date(Date.now() - 86400000).toISOString().slice(0, 10);\n\n// action_type values that count as a 'result', in priority order. Meta varies\n// by account/objective — mirror the Phase-1 reporting agent's lead matching.\nconst RESULT_TYPES = ['lead','onsite_conversion.lead_grouped','offsite_conversion.fdt_lead','leadgen.other','onsite_web_lead','offsite_conversion.fdt_purchase','purchase','omni_purchase','link_click'];\n\nfunction pickResults(actions) {\n  if (!Array.isArray(actions)) return 0;\n  for (const t of RESULT_TYPES) {\n    const hit = actions.find(a => a.action_type === t);\n    if (hit) return Number(hit.value || 0);\n  }\n  return 0;\n}\n\n// time_increment=1 returns one row per day in `data` (yesterday + today) —\n// emit one output item per (campaign, day) instead of just one per campaign,\n// so today's still-accumulating spend gets its own row alongside yesterday's\n// final one.\nconst out = [];\ncampaigns.forEach((c, i) => {\n  const rows = (searches[i] && searches[i].json.data) || [];\n  if (rows.length === 0) {\n    out.push({ json: {\n      campaign_id: c.json.campaignRowId,\n      date: fallbackDate,\n      spend: 0, results: 0, cost_per_result: null,\n      impressions: 0, clicks: 0, cpm: 0, cpc: 0, ctr: 0, frequency: 0, roas: null,\n    } });\n    return;\n  }\n  for (const row of rows) {\n    const spend = Number(row.spend || 0);\n    const results = pickResults(row.actions);\n    const roasArr = Array.isArray(row.purchase_roas) ? row.purchase_roas : [];\n    const roas = roasArr.length ? Number(roasArr[0].value || 0) : null;\n    out.push({ json: {\n      campaign_id: c.json.campaignRowId,\n      date: row.date_start || fallbackDate,\n      spend,\n      results,\n      cost_per_result: results > 0 ? spend / results : null,\n      impressions: Number(row.impressions || 0),\n      clicks: Number(row.clicks || 0),\n      cpm: Number(row.cpm || 0),\n      cpc: Number(row.cpc || 0),\n      ctr: Number(row.ctr || 0),\n      frequency: Number(row.frequency || 0),\n      roas,\n    } });\n  }\n});\nreturn out;\n"
       },
       "id": "e1000000-0000-0000-0000-000000000007",
       "name": "Build metrics row",
@@ -264,7 +265,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const campaigns = $('Filter synced campaigns').all();\nconst metricsRows = $('Build metrics row').all();\nconst allRecs = $('Build recommendation items').all().map(i => i.json).filter(r => r && r.campaign_id);\nreturn campaigns.map((c, i) => {\n  const m = (metricsRows[i] && metricsRows[i].json) || {};\n  const recRows = allRecs.filter(r => r.campaign_id === c.json.campaignRowId);\n  const roas = m.roas != null ? m.roas : null;\n  const recsText = recRows.length ? recRows.map(r => '- ' + r.type).join('\\n') : 'None currently open.';\n  return { json: {\n    campaignRowId: c.json.campaignRowId,\n    campaignName: c.json.campaignName,\n    status: c.json.status,\n    objective: c.json.objective,\n    dailyBudgetUsd: c.json.dailyBudgetUsd,\n    date: m.date,\n    spend: m.spend,\n    results: m.results,\n    costPerResult: m.cost_per_result,\n    roas,\n    recommendationsText: recsText,\n  } };\n});\n"
+        "jsCode": "const campaigns = $('Filter synced campaigns').all();\nconst metricsRows = $('Build metrics row').all().map(i => i.json);\nconst allRecs = $('Build recommendation items').all().map(i => i.json).filter(r => r && r.campaign_id);\nreturn campaigns.map((c) => {\n  // 'Build metrics row' now emits one item per (campaign, day) since\n  // time_increment=1 can return yesterday + today — match by campaign_id\n  // (not position) and use the most recent date, so a positional mismatch\n  // between campaigns and metric rows can't silently mix up two campaigns.\n  const rowsForCampaign = metricsRows.filter(m => m.campaign_id === c.json.campaignRowId);\n  rowsForCampaign.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));\n  const m = rowsForCampaign[0] || {};\n  const recRows = allRecs.filter(r => r.campaign_id === c.json.campaignRowId);\n  const roas = m.roas != null ? m.roas : null;\n  const recsText = recRows.length ? recRows.map(r => '- ' + r.type).join('\\n') : 'None currently open.';\n  return { json: {\n    campaignRowId: c.json.campaignRowId,\n    campaignName: c.json.campaignName,\n    status: c.json.status,\n    objective: c.json.objective,\n    dailyBudgetUsd: c.json.dailyBudgetUsd,\n    date: m.date,\n    spend: m.spend,\n    results: m.results,\n    costPerResult: m.cost_per_result,\n    roas,\n    recommendationsText: recsText,\n  } };\n});\n"
       },
       "id": "e1000000-0000-0000-0000-000000000012",
       "name": "Build suggestion context",
@@ -275,10 +276,10 @@
     {
       "parameters": {
         "promptType": "define",
-        "text": "=Campaign: {{ $json.campaignName }} (status: {{ $json.status }}, objective {{ $json.objective }}, daily budget ${{ $json.dailyBudgetUsd }}).\nYesterday ({{ $json.date }}): spend ${{ $json.spend }}, results {{ $json.results }}, cost per result {{ $json.costPerResult || 'n/a' }}, ROAS {{ $json.roas || 'n/a' }}.\n\nOpen Meta recommendations:\n{{ $json.recommendationsText }}",
+        "text": "=Campaign: {{ $json.campaignName }} (status: {{ $json.status }}, objective {{ $json.objective }}, daily budget ${{ $json.dailyBudgetUsd }}).\nMost recent day with data ({{ $json.date }}): spend ${{ $json.spend }}, results {{ $json.results }}, cost per result {{ $json.costPerResult || 'n/a' }}, ROAS {{ $json.roas || 'n/a' }}.\n\nOpen Meta recommendations:\n{{ $json.recommendationsText }}",
         "hasOutputParser": true,
         "options": {
-          "systemMessage": "You are reviewing this Meta (Facebook/Instagram) Ads campaign's daily performance sync automatically, on behalf of an agency, with no human having asked a question. Decide whether there's a genuinely useful, specific, non-obvious suggestion worth surfacing right now — a clear problem (real spend with zero results, runaway cost per result, obvious frequency/fatigue issue) or a binding budget. Be conservative: should_post = false unless something actually stands out. A missed suggestion beats noise the agency learns to ignore.\n\nWhen should_post is true, action_type follows the same rules as everywhere in this project: \"none\" UNLESS you're suggesting exactly one of update_daily_budget (daily_budget_usd required, a specific positive number), pause_campaign, or resume_campaign, with a one-sentence reason in the reason field. For action_type \"none\" (most posts), set daily_budget_usd to 0 and reason to an empty string."
+          "systemMessage": "You are reviewing this Meta (Facebook/Instagram) Ads campaign's daily performance sync automatically, on behalf of an agency, with no human having asked a question. Post a short, genuinely useful observation most days — this is meant to feel like an analyst actively watching the account, not a silent alarm that only trips for emergencies. Only stay silent (should_post = false) when there is truly nothing worth a sentence: an active campaign with real spend almost always has SOMETHING worth naming — how cost per result compares to what a healthy range looks like for this kind of campaign, whether spend/results are trending in a good direction, a frequency or CTR worth flagging, or simply confirming performance is healthy and budget could be scaled. should_post = false only for a campaign with no spend/no data to evaluate, or where you've already said the same thing very recently. Never invent numbers you weren't given.\n\naction_type follows the same rules as everywhere in this project: \"none\" UNLESS you're recommending exactly one of update_daily_budget (daily_budget_usd required, a specific positive number — e.g. when performance is healthy and scaling up is a reasonable next step), pause_campaign, or resume_campaign, with a one-sentence reason in the reason field. Most observations are informational only and get action_type \"none\" (daily_budget_usd 0, reason empty) — only propose an action when it's a clear, specific, agency-approvable change, not for every post."
         }
       },
       "id": "e1000000-0000-0000-0000-000000000013",
@@ -343,7 +344,8 @@
           { "fieldId": "role", "fieldValue": "assistant" },
           { "fieldId": "content", "fieldValue": "={{ $json.message }}" },
           { "fieldId": "proposed_action", "fieldValue": "={{ $json.proposedAction }}" },
-          { "fieldId": "action_status", "fieldValue": "={{ $json.actionStatus }}" }
+          { "fieldId": "action_status", "fieldValue": "={{ $json.actionStatus }}" },
+          { "fieldId": "origin", "fieldValue": "proactive" }
         ] }
       },
       "id": "e1000000-0000-0000-0000-000000000018",
@@ -352,7 +354,7 @@
       "typeVersion": 1,
       "position": [2600, 220],
       "credentials": { "supabaseApi": { "id": "REPLACE_WITH_META_SUPABASE_CRED", "name": "Supabase Meta Ads" } },
-      "notes": "Posts into the same campaign_chat_messages table the Campaign Assistant tab reads — shows up like an unprompted assistant message. Confirm & Apply / Dismiss work identically."
+      "notes": "Posts into the same campaign_chat_messages table the Campaign Assistant tab reads — shows up like an unprompted assistant message, AND (origin='proactive') surfaces on the Recommendations tab. Confirm & Apply / Dismiss work identically either place."
     },
 
     {

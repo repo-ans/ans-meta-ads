@@ -102,6 +102,8 @@ export interface Message {
   sent_at: string | null
 }
 
+export type ChatMessageOrigin = 'user_reply' | 'proactive'
+
 export interface CampaignChatMessage {
   id: string
   campaign_id: string
@@ -109,6 +111,11 @@ export interface CampaignChatMessage {
   content: string | null
   proposed_action: ProposedAction | null
   action_status: ChatActionStatus | null
+  // 'proactive' = posted unprompted by the daily sync's AI review (surfaced
+  // under the Recommendations tab). 'user_reply' = a reply to something the
+  // agency typed in Campaign Assistant. null = legacy row, predates this
+  // column.
+  origin: ChatMessageOrigin | null
   created_at: string
 }
 
